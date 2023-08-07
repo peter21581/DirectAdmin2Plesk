@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Check if Plesk exists
+if ! command -v plesk &>/dev/null; then
+    echo "Plesk not found. This script is meant to be run on a Plesk server. Exiting..."
+    exit 1
+fi
+
 # Check if sshpass is installed
 if ! command -v sshpass &>/dev/null; then
     echo "sshpass not found. Trying to install it..."
