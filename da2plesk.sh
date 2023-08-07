@@ -1,5 +1,22 @@
 #!/bin/bash
 
+# Check if sshpass is installed
+if ! command -v sshpass &>/dev/null; then
+    echo "sshpass not found. Trying to install it..."
+
+    # Determine package manager and try to install sshpass
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update && sudo apt-get install -y sshpass
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y sshpass
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y sshpass
+    else
+        echo "Could not find a package manager to install sshpass. Please install it manually."
+        exit 1
+    fi
+f
+
 # 1. Inform the user about the impending migration
 echo "Preparing for migration from DirectAdmin to Plesk..."
 
