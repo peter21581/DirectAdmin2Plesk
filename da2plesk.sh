@@ -35,18 +35,34 @@ read -p "Enter DirectAdmin SSH port [default: 22]: " da_port
 da_port=${da_port:-22}  # Set default port to 22 if none specified
 
 # Execute commands on the DirectAdmin server
-sshpass -p "$da_pass" ssh -p $da_port $da_user@$da_ip <<EOF
+sshpass -p "$da_pass" ssh -T -p $da_port $da_user@$da_ip <<EOF
 echo -e "[client]\nuser=da_admin\npassword=\$(grep "^passwd=" /usr/local/directadmin/conf/mysql.conf | cut -d= -f2)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf;
 
 # Check innodb_strict_mode
 innodb_mode=\$(mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "OFF")
 if [ "\$innodb_mode" -eq 0 ]; then
+    echo "Updating innodb_strict_mode..."
     echo "innodb_strict_mode=0" >> /etc/my.cnf || echo "innodb_strict_mode=0" >> /etc/mysql/my.cnf && service mariadb restart
 fi
 
+echo "Configuring MySQL permissions..."
 user=\$(awk -F= '/user=/ {print \$2}' /usr/local/directadmin/conf/my.cnf) && pass=\$(awk -F= '/password=/ {gsub(/"/,"",\$2); print \$2}' /usr/local/directadmin/conf/my.cnf) && mysql -e "GRANT ALL PRIVILEGES ON *.* TO '\$user'@'127.0.0.1' IDENTIFIED BY '\$pass' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+
+echo "Checking DirectAdmin configuration..."
 grep -q "mysqlconf" /usr/local/directadmin/conf/directadmin.conf || { [ -f /usr/local/directadmin/conf/mysql.conf ] && echo "mysqlconf=/usr/local/directadmin/conf/mysql.conf" >> /usr/local/directadmin/conf/directadmin.conf; }
+
+# Displaying innodb_strict_mode
+echo "Current innodb_strict_mode value:"
+mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';"
+
+# Check if mysqlconf exists in directadmin.conf
+if grep -q "mysqlconf" /usr/local/directadmin/conf/directadmin.conf; then
+    echo "'mysqlconf' exists in directadmin.conf"
+else
+    echo "'mysqlconf' not found in directadmin.conf"
+fi
 EOF
+
 
 
 # Back at the local server
