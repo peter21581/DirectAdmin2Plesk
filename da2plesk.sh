@@ -21,7 +21,7 @@ if ! command -v sshpass &>/dev/null; then
         echo "Could not find a package manager to install sshpass. Please install it manually."
         exit 1
     fi
-f
+fi
 
 # 1. Inform the user about the impending migration
 echo "Preparing for migration from DirectAdmin to Plesk..."
