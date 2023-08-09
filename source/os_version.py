@@ -11,6 +11,7 @@ class OSName(object):
     OS_WINDOWS = 'windows'
     OS_LINUX = 'linux'
     OS_CENTOS = 'centos'
+    OS_CENTOS = 'almalinux'
     OS_RHEL = 'rhel'
     OS_DEBIAN = 'debian'
     OS_UBUNTU = 'ubuntu'
@@ -131,6 +132,7 @@ def _detect_linux_os_version_from_os_release_file(runner):
             'ubuntu': OSName.OS_UBUNTU,
             'debian': OSName.OS_DEBIAN,
             'centos': OSName.OS_CENTOS,
+            'almalinux': OSName.OS_CENTOS,
             'rhel': OSName.OS_RHEL,
             'cloudlinux': OSName.OS_CLOUDLINUX
         }
