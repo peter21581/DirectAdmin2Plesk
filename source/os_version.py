@@ -11,7 +11,6 @@ class OSName(object):
     OS_WINDOWS = 'windows'
     OS_LINUX = 'linux'
     OS_CENTOS = 'centos'
-    OS_CENTOS = 'almalinux'
     OS_RHEL = 'rhel'
     OS_DEBIAN = 'debian'
     OS_UBUNTU = 'ubuntu'
