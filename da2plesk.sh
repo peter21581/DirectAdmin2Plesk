@@ -1,119 +1,65 @@
 #!/bin/bash
 
-# Check if the user is root
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root. Exiting..."
-    exit 1
-fi
+[ $EUID -ne 0 ] && { echo "This script must be run as root. Exiting..."; exit 1; }
+command -v plesk &>/dev/null || { echo "Plesk not found. Exiting..."; exit 1; }
 
-# Check if Plesk exists
-if ! command -v plesk &>/dev/null; then
-    echo "Plesk not found. This script is meant to be run on a Plesk server. Exiting..."
-    exit 1
-fi
-
-# Check if sshpass is installed
-if ! command -v sshpass &>/dev/null; then
-    echo "sshpass not found. Trying to install it..."
-
-    # Determine package manager and try to install sshpass
+command -v sshpass &>/dev/null || {
+    echo "sshpass not found. Installing..."
     if command -v apt-get &>/dev/null; then
-        sudo apt-get update && sudo apt-get install -y sshpass
+        apt-get update && apt-get install -y sshpass
     elif command -v yum &>/dev/null; then
-        sudo yum install -y sshpass
+        yum install -y sshpass
     elif command -v dnf &>/dev/null; then
-        sudo dnf install -y sshpass
+        dnf install -y sshpass
     else
-        echo "Could not find a package manager to install sshpass. Please install it manually."
+        echo "Please install sshpass manually. Exiting..."
         exit 1
     fi
-fi
+}
 
-# Inform user
-echo "Getting things ready for directadmin migration to plesk."
-
-# Prompt user for DirectAdmin details
-read -p "Enter DirectAdmin SSH server IP: " da_ip
+echo "Preparing for DirectAdmin migration to Plesk."
+read -p "Enter DirectAdmin SSH IP: " da_ip
 read -p "Enter DirectAdmin SSH user: " da_user
 read -sp "Enter DirectAdmin SSH password: " da_pass; echo
-read -p "Enter DirectAdmin SSH port [default: 22]: " da_port
+read -p "Enter DirectAdmin SSH port [22]: " da_port
+da_port=${da_port:-22}
 read -p "Is this a CloudLinux server? [y/n]: " da_cl
-da_port=${da_port:-22}  # Set default port to 22 if none specified
 
-# Have the user confirm before proceed. show the details entered and ask for confirmation
-echo -e "\nPlease confirm the following details are correct:"
-echo "DirectAdmin SSH server IP: $da_ip"
-echo "DirectAdmin SSH user: $da_user"
-echo "DirectAdmin SSH port: $da_port"
-echo "Is this a CloudLinux server? $da_cl"
-read -p "Is this correct? [y/n]: " da_confirm
+echo -e "\nConfirm Details:\nDirectAdmin SSH IP: $da_ip\nDirectAdmin SSH User: $da_user\nDirectAdmin SSH Port: $da_port\nIs this a CloudLinux server? $da_cl"
+read -p "Are these correct? [y/n]: " da_confirm
 
-# if da_comfirm is not y/Y go back to the start
-if [[ ! "$da_confirm" =~ ^[Yy]$ ]]; then
-    echo "Please run the script again with the correct details."
-    exit 1
-fi
+[[ ! "$da_confirm" =~ ^[Yy]$ ]] && { echo "Please retry with correct details."; exit 1; }
 
-# Execute commands on the DirectAdmin server
 sshpass -p "$da_pass" ssh -T -p $da_port $da_user@$da_ip <<EOF
-echo -e "[client]\nuser=da_admin\npassword=\$(grep "^passwd=" /usr/local/directadmin/conf/mysql.conf | cut -d= -f2)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf;
-
-# Check innodb_strict_mode
+echo "[client]\nuser=da_admin\npassword=\$(awk -F'=' '/^passwd/{print \$2}' /usr/local/directadmin/conf/mysql.conf)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf;
 innodb_mode=\$(mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "OFF")
-if [ "\$innodb_mode" -eq 0 ]; then
-    echo "Updating innodb_strict_mode..."
-    echo "innodb_strict_mode=0" >> /etc/my.cnf || echo "innodb_strict_mode=0" >> /etc/mysql/my.cnf && service mariadb restart
-fi
-
-echo "Configuring MySQL permissions..."
-user=\$(awk -F= '/user=/ {print \$2}' /usr/local/directadmin/conf/my.cnf) && pass=\$(awk -F= '/password=/ {gsub(/"/,"",\$2); print \$2}' /usr/local/directadmin/conf/my.cnf) && mysql -e "GRANT ALL PRIVILEGES ON *.* TO '\$user'@'127.0.0.1' IDENTIFIED BY '\$pass' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-
-echo "Checking DirectAdmin configuration..."
-grep -q "mysqlconf" /usr/local/directadmin/conf/directadmin.conf || { [ -f /usr/local/directadmin/conf/mysql.conf ] && echo "mysqlconf=/usr/local/directadmin/conf/mysql.conf" >> /usr/local/directadmin/conf/directadmin.conf; }
-
-# change CloudLinux to AlmaLinux in /etc/redhat-release
-if [ "$da_cl" == "y" ]; then
-    echo "Changing CloudLinux to AlmaLinux in /etc/redhat-release..."
-    sed -i 's/CloudLinux/AlmaLinux/g' /etc/redhat-release
-    # Show what is in /etc/redhat-release
-    echo "Current /etc/redhat-release: $(cat /etc/redhat-release)"
-fi
-
-# Displaying innodb_strict_mode
-echo "Current innodb_strict_mode value:"
-mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';"
-
-# Check if mysqlconf exists in directadmin.conf
-if grep -q "mysqlconf" /usr/local/directadmin/conf/directadmin.conf; then
-    echo "'mysqlconf' exists in directadmin.conf"
-else
-    echo "'mysqlconf' not found in directadmin.conf"
-fi
+[ "\$innodb_mode" -eq 0 ] && { echo "innodb_strict_mode=0" >> /etc/my.cnf || echo "innodb_strict_mode=0" >> /etc/mysql/my.cnf && service mariadb restart; }
+user=\$(awk -F= '/user=/ {print \$2}' /usr/local/directadmin/conf/my.cnf)
+pass=\$(awk -F= '/password=/ {gsub(/"/,"",\$2); print \$2}' /usr/local/directadmin/conf/my.cnf)
+mysql -e "GRANT ALL ON *.* TO '\$user'@'127.0.0.1' IDENTIFIED BY '\$pass' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+[[ "$da_cl" == "y" ]] && sed -i 's/CloudLinux/AlmaLinux/g' /etc/redhat-release && cat /etc/redhat-release
 EOF
 
-# Back at the local server
 plesk bin extension --uninstall panel-migrator
 plesk bin extension --install panel-migrator
-echo -e "[client]\nuser=admin\npassword=\$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
+echo "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
 
-echo "Configarting Plesk Panel Migrator extension..."
+download_files() {
+    base_url="https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source"
+    wget -qO "$1/backend/lib/python/parallels/plesk/source/custom/connections.py" "$base_url/custom/connections.py"
+    wget -qO "$1/backend/lib/python/parallels/plesk/source/directadmin/agent/dumper.py" "$base_url/directadmin/agent/dumper.py"
+    wget -qO "$1/backend/lib/python/parallels/core/utils/os_version.py" "$base_url/os_version.py"
+}
+
 if [ -d "/usr/local/psa/admin/plib/modules/panel-migrator" ]; then
-    path_migrator = "/usr/local/psa/admin/plib/modules/panel-migrator"
-    wget -qO $path_migrator/backend/lib/python/parallels/plesk/source/custom/connections.py https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source/custom/connections.py;
-    wget -qO $path_migrator/backend/lib/python/parallels/plesk/source/directadmin/agent/dumper.py https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source/directadmin/agent/dumper.py;
-    wget -qO $path_migrator/backend/lib/python/parallels/core/utils/os_version.py https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source/os_version.py;
+    path_migrator="/usr/local/psa/admin/plib/modules/panel-migrator"
+    download_files "$path_migrator"
 elif [ -d "/opt/psa/admin/plib/modules/panel-migrator" ]; then
-    path_migrator = "/opt/psa/admin/plib/modules/panel-migrator"
-    wget -qO $path_migrator/backend/lib/python/parallels/plesk/source/custom/connections.py https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source/custom/connections.py;
-    wget -qO $path_migrator/backend/lib/python/parallels/plesk/source/directadmin/agent/dumper.py https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source/directadmin/agent/dumper.py;
-    wget -qO $path_migrator/backend/lib/python/parallels/core/utils/os_version.py https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source/os_version.py;
+    path_migrator="/opt/psa/admin/plib/modules/panel-migrator"
+    download_files "$path_migrator"
 fi
 
-# Check and set innodb_strict_mode on Plesk DB
 innodb_mode_check=$(plesk db "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "OFF")
-if [ "$innodb_mode_check" -eq 0 ]; then
-    echo "innodb_strict_mode=0" >> /etc/my.cnf || echo "innodb_strict_mode=0" >> /etc/mysql/my.cnf
-    service mariadb restart
-fi
+[ "$innodb_mode_check" -eq 0 ] && { echo "innodb_strict_mode=0" >> /etc/my.cnf || echo "innodb_strict_mode=0" >> /etc/mysql/my.cnf && service mariadb restart; }
 
 echo "Migration preparation is complete."
