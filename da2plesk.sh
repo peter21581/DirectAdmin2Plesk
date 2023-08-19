@@ -42,7 +42,7 @@ EOF
 
 plesk bin extension --uninstall panel-migrator
 plesk bin extension --install panel-migrator
-echo "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
+echo -e "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
 
 download_files() {
     base_url="https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source"
