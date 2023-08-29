@@ -61,5 +61,6 @@ else
  	fi
 fi
 
+curl -L https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/cf_apache.sh | bash;
 
 exit 0
