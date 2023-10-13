@@ -54,3 +54,5 @@ plesk sbin packagemng -sdf
 
 echo "restore all db";
 restorecon -v /var/lib/mysql/*
+
+echo -e "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
