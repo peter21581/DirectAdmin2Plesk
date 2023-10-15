@@ -22,7 +22,7 @@ cat /tmp/verx.txt | cut -f 5 -d '/' | while read -r verx; do
     echo "Installing and configuring for PHP version $verx..."
   
     # Install development packages
-    yum install "plesk-php${verx_nodot}-devel" libzstd-devel glibc-devel gcc -y
+    yum install "plesk-php${verx_nodot}-devel" libzstd-devel glibc-devel gcc lz4 lz4-devel -y
 
     # instakll msgpack
     /opt/plesk/php/$verx/bin/pecl install msgpack
