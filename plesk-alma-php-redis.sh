@@ -23,6 +23,19 @@ cat /tmp/verx.txt | cut -f 5 -d '/' | while read -r verx; do
   
     # Install development packages
     yum install "plesk-php${verx_nodot}-devel" libzstd-devel glibc-devel gcc -y
+
+    # instakll msgpack
+    /opt/plesk/php/$verx/bin/pecl install msgpack
+
+        # If igbinary.so exists, create its .ini file
+    if [ -f "/opt/plesk/php/$verx/lib64/php/modules/msgpack.so" ]; then
+        cat <<EOF > "/opt/plesk/php/$verx/etc/php.d/msgpack.ini"
+extension=msgpack.so
+EOF
+    else
+        echo "msgpack.so does not exist. Exiting..."
+        exit 1
+    fi
   
     # Install igbinary
     /opt/plesk/php/$verx/bin/pecl install igbinary
@@ -55,6 +68,7 @@ EOF
     echo 'expose_php = off' > "/opt/plesk/php/$verx/etc/php.d/hideheader.ini"
   
     # Set permissions
+    chmod 755 "/opt/plesk/php/$verx/lib64/php/modules/msgpack.so"
     chmod 755 "/opt/plesk/php/$verx/lib64/php/modules/redis.so"
     chmod 755 "/opt/plesk/php/$verx/lib64/php/modules/igbinary.so"
   
