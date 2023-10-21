@@ -50,20 +50,20 @@ EOF
 
 # Start the new integration
 sshpass -p "$da_pass" ssh -T -p $da_port $da_user@$da_ip <<EOF
-MYSQLCONF_VALUE=$(/usr/local/directadmin/directadmin c | grep mysqlconf)
+# Ensure directadmin command is available
+if ! command -v /usr/local/directadmin/directadmin &>/dev/null; then
+    echo "Error: DirectAdmin command not found."
+    exit 1
+fi
+
+MYSQLCONF_VALUE=\$(/usr/local/directadmin/directadmin c | grep mysqlconf)
 
 # Check if mysqlconf or mysql_conf exist in directadmin.conf
-grep -q "mysqlconf=" /usr/local/directadmin/conf/directadmin.conf
-MYSQLCONF_EXISTS=$?
-
-grep -q "mysql_conf=" /usr/local/directadmin/conf/directadmin.conf
-MYSQL_CONF_EXISTS=$?
-
-# If neither exist, append them to the file
-if [[ $MYSQLCONF_EXISTS -ne 0 ]] && [[ $MYSQL_CONF_EXISTS -ne 0 ]]; then
-    echo "$MYSQLCONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
-    MYSQL_CONF_VALUE="mysql_conf=$(echo "$MYSQLCONF_VALUE" | cut -d'=' -f2)"
-    echo "$MYSQL_CONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
+if ! grep -q "mysqlconf" /usr/local/directadmin/conf/directadmin.conf && \
+   ! grep -q "mysql_conf" /usr/local/directadmin/conf/directadmin.conf; then
+    echo "\$MYSQLCONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
+    MYSQL_CONF_VALUE="mysql_conf=\$(echo "\$MYSQLCONF_VALUE" | cut -d'=' -f2)"
+    echo "\$MYSQL_CONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
 fi
 EOF
 # End the new integration
