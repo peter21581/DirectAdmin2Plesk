@@ -30,6 +30,14 @@ read -p "Are these correct? [y/n]: " da_confirm
 
 [[ ! "$da_confirm" =~ ^[Yy]$ ]] && { echo "Please retry with correct details."; exit 1; }
 
+# Test SSH login
+echo "Testing SSH login to DirectAdmin server..."
+sshpass -p "$da_pass" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $da_port $da_user@$da_ip "echo 'SSH login successful.'"
+if [ $? -ne 0 ]; then
+    echo "Error: Unable to SSH into the DirectAdmin server. Please check the provided details and try again."
+    exit 1
+fi
+
 sshpass -p "$da_pass" ssh -T -p $da_port $da_user@$da_ip <<EOF
 echo "[client]\nuser=da_admin\npassword=\$(awk -F'=' '/^passwd/{print \$2}' /usr/local/directadmin/conf/mysql.conf)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf;
 innodb_mode=\$(mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "OFF")
@@ -39,6 +47,26 @@ pass=\$(awk -F= '/password=/ {gsub(/"/,"",\$2); print \$2}' /usr/local/directadm
 mysql -e "GRANT ALL ON *.* TO '\$user'@'127.0.0.1' IDENTIFIED BY '\$pass' WITH GRANT OPTION; FLUSH PRIVILEGES;"
 [[ "$da_cl" == "y" ]] && sed -i 's/CloudLinux/AlmaLinux/g' /etc/redhat-release && cat /etc/redhat-release
 EOF
+
+# Start the new integration
+sshpass -p "$da_pass" ssh -T -p $da_port $da_user@$da_ip <<EOF
+MYSQLCONF_VALUE=$(/usr/local/directadmin/directadmin c | grep mysqlconf)
+
+# Check if mysqlconf or mysql_conf exist in directadmin.conf
+grep -q "mysqlconf=" /usr/local/directadmin/conf/directadmin.conf
+MYSQLCONF_EXISTS=$?
+
+grep -q "mysql_conf=" /usr/local/directadmin/conf/directadmin.conf
+MYSQL_CONF_EXISTS=$?
+
+# If neither exist, append them to the file
+if [[ $MYSQLCONF_EXISTS -ne 0 ]] && [[ $MYSQL_CONF_EXISTS -ne 0 ]]; then
+    echo "$MYSQLCONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
+    MYSQL_CONF_VALUE="mysql_conf=$(echo "$MYSQLCONF_VALUE" | cut -d'=' -f2)"
+    echo "$MYSQL_CONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
+fi
+EOF
+# End the new integration
 
 plesk bin extension --uninstall panel-migrator
 plesk bin extension --install panel-migrator
