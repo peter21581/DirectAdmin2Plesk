@@ -65,6 +65,27 @@ if ! grep -q "mysqlconf" /usr/local/directadmin/conf/directadmin.conf && \
     MYSQL_CONF_VALUE="mysql_conf=\$(echo "\$MYSQLCONF_VALUE" | cut -d'=' -f2)"
     echo "\$MYSQL_CONF_VALUE" >> /usr/local/directadmin/conf/directadmin.conf
 fi
+
+# Extract path of mysql.conf from directadmin command output
+MYSQL_CONF_PATH=\$(/usr/local/directadmin/directadmin c | awk -F'=' '/mysqlconf/{print \$2}')
+
+# Extract password from the determined mysql.conf path
+DA_ADMIN_PASSWD=\$(awk -F'=' '/^passwd/{print \$2}' "\$MYSQL_CONF_PATH")
+
+# Grant permissions to da_admin for both localhost (IPv4) and ::1 (IPv6)
+mysql -e "GRANT ALL PRIVILEGES ON *.* TO 'da_admin'@'localhost' IDENTIFIED BY '\$DA_ADMIN_PASSWD'; FLUSH PRIVILEGES;"
+mysql -e "GRANT ALL PRIVILEGES ON *.* TO 'da_admin'@'::1' IDENTIFIED BY '\$DA_ADMIN_PASSWD'; FLUSH PRIVILEGES;"
+
+# Testing if the da_admin user can log in using the extracted password and retrieve the innodb_strict_mode variable
+TEST_RESULT=\$(mysql -h localhost -P 3306 -uda_admin -p"\$DA_ADMIN_PASSWD" --silent --skip-column-names -e 'SHOW VARIABLES LIKE "innodb_strict_mode"')
+
+# Check and output the result
+if [ -z "\$TEST_RESULT" ]; then
+    echo "Error: Unable to retrieve innodb_strict_mode using the da_admin user and extracted password."
+else
+    echo "Successfully retrieved innodb_strict_mode: \$TEST_RESULT"
+fi
+
 EOF
 # End the new integration
 
