@@ -37,7 +37,7 @@ innodb_mode=\$(mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "O
 user=\$(awk -F= '/user=/ {print \$2}' /usr/local/directadmin/conf/my.cnf)
 pass=\$(awk -F= '/password=/ {gsub(/"/,"",\$2); print \$2}' /usr/local/directadmin/conf/my.cnf)
 mysql -e "GRANT ALL ON *.* TO '\$user'@'127.0.0.1' IDENTIFIED BY '\$pass' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-[[ "$da_cl" == "y" ]] && sed -i 's/CloudLinux/AlmaLinux/g' /etc/redhat-release && cat /etc/redhat-release
+[[ "$da_cl" == "y" ]] && /bin/cp -rpvf /etc/redhat-release /etc/redhat-release.orig && sed -i 's/CloudLinux/AlmaLinux/g' /etc/redhat-release && cat /etc/redhat-release
 EOF
 
 plesk bin extension --uninstall panel-migrator
