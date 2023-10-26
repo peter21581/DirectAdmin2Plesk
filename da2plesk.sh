@@ -39,7 +39,7 @@ if [ $? -ne 0 ]; then
 fi
 
 sshpass -p "$da_pass" ssh -T -p $da_port $da_user@$da_ip <<EOF
-echo "[client]\nuser=da_admin\npassword=\$(awk -F'=' '/^passwd/{print \$2}' /usr/local/directadmin/conf/mysql.conf)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf;
+echo -e "[client]\nuser=da_admin\npassword=\$(awk -F'=' '/^passwd/{print \$2}' /usr/local/directadmin/conf/mysql.conf)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf;
 innodb_mode=\$(mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "OFF")
 [ "\$innodb_mode" -eq 0 ] && { echo "innodb_strict_mode=0" >> /etc/my.cnf || echo "innodb_strict_mode=0" >> /etc/mysql/my.cnf && service mariadb restart; }
 user=\$(awk -F= '/user=/ {print \$2}' /usr/local/directadmin/conf/my.cnf)
