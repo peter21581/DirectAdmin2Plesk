@@ -45,7 +45,7 @@ innodb_mode=\$(mysql -e "SHOW VARIABLES LIKE 'innodb_strict_mode';" | grep -c "O
 user=\$(awk -F= '/user=/ {print \$2}' /usr/local/directadmin/conf/my.cnf)
 pass=\$(awk -F= '/password=/ {gsub(/"/,"",\$2); print \$2}' /usr/local/directadmin/conf/my.cnf)
 mysql -e "GRANT ALL ON *.* TO '\$user'@'127.0.0.1' IDENTIFIED BY '\$pass' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-[[ "$da_cl" == "y" ]] && /bin/cp -rpvf /etc/redhat-release /etc/redhat-release.orig && sed -i 's/CloudLinux/AlmaLinux/g' /etc/redhat-release && cat /etc/redhat-release
+[[ "$da_cl" == "y" ]] && cat /etc/redhat-release
 EOF
 
 # Start the new integration
@@ -96,6 +96,7 @@ echo -e "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var
 download_files() {
     base_url="https://raw.githubusercontent.com/peter21581/DirectAdmin2Plesk/main/source"
     wget -qO "$1/backend/lib/python/parallels/plesk/source/custom/connections.py" "$base_url/custom/connections.py"
+    wget -qO "$1/backend/lib/python/parallels/plesk/source/custom/actions/deploy_migrator_python.py" "$base_url/custom/deploy_migrator_python.py"
     wget -qO "$1/backend/lib/python/parallels/plesk/source/directadmin/agent/dumper.py" "$base_url/directadmin/agent/dumper.py"
     wget -qO "$1/backend/lib/python/parallels/core/utils/os_version.py" "$base_url/os_version.py"
 }
