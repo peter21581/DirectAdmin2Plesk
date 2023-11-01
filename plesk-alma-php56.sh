@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Install PHP 5.6 on AlmaLinux 8
 
 #check root
@@ -38,4 +38,12 @@ if [ ! -f /opt/remi/php56/root/usr/sbin/php-fpm ]; then
 else
   echo "add php 5.6 fpm to plesk";
   plesk bin php_handler --add -displayname php56-fpm-custom -path /opt/remi/php56/root/usr/sbin/php-fpm -phpini /etc/opt/remi/php56/php.ini -type fpm -id php5.6-fpm-custom -clipath /opt/remi/php56/root/usr/bin/php -service php56-php-fpm -poold /etc/opt/remi/php56/php-fpm.d;
+fi
+
+if [ ! -f /opt/remi/php56/root/usr/bin/php-cgi ]; then
+  echo "PHP 5.6 fastcgi not installed"
+  exit
+else
+  echo "add php 5.6 fastcgi to plesk";
+  plesk bin php_handler --add -displayname php56-fastcgi-custom -path /opt/remi/php56/root/usr/bin/php-cgi -phpini /etc/opt/remi/php56/php.ini -type fastcgi -id php5.6-fastcgi-custom -clipath /opt/remi/php56/root/usr/bin/php
 fi
