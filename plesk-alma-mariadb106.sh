@@ -40,7 +40,7 @@ priority=1
 EOF
 
 echo "install mariadb 10.6";
-dnf install -y MariaDB-server galera-4 MariaDB-client MariaDB-shared MariaDB-backup MariaDB-common;
+dnf install -y MariaDB-server galera-4 MariaDB-client MariaDB-shared MariaDB-backup MariaDB-common --allowerasing;
 
 echo "download my.cnf";
 curl -L ddos.de.co.th/da_mariadb.sh | bash;
