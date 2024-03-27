@@ -18,6 +18,8 @@ if [ ! -f /etc/psa/.psa.shadow ]; then
   exit
 fi
 
+echo -e "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
+
 # Script to install MariaDB 10.6 on AlmaLinux 8.x
 echo "dump all db to /tmp/all-databases.sql";
 MYSQL_PWD=`cat /etc/psa/.psa.shadow` mysqldump -u admin --verbose --all-databases --routines --triggers > /tmp/all-databases.sql;
@@ -54,5 +56,3 @@ plesk sbin packagemng -sdf
 
 echo "restore all db";
 restorecon -v /var/lib/mysql/*
-
-echo -e "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
