@@ -92,10 +92,14 @@ class DeployMigratorPython(CommonAction):
             (OSName.OS_DEBIAN, '8'): ('jessie', 'PMM_0.1.11'),
             (OSName.OS_DEBIAN, '9'): ('stretch', 'PMM_0.1.11'),
             (OSName.OS_DEBIAN, '10'): ('buster', 'PMM_0.1.11'),
+            (OSName.OS_DEBIAN, '11'): ('bullseye', 'PMM_0.1.11'),
             (OSName.OS_UBUNTU, '12'): ('precise', 'ubuntu/PMM_0.1.10'),
             (OSName.OS_UBUNTU, '14'): ('trusty', 'ubuntu/PMM_0.1.10'),
             (OSName.OS_UBUNTU, '16'): ('xenial', 'PMM_0.1.11'),
             (OSName.OS_UBUNTU, '18'): ('bionic', 'PMM_0.1.11'),
+            (OSName.OS_UBUNTU, '20'): ('focal', 'PMM_0.1.11'),
+            (OSName.OS_UBUNTU, '22'): ('jammy', 'PMM_0.1.11'),
+            (OSName.OS_UBUNTU, '24'): ('noble', 'PMM_0.1.11'),
         }
         redhat_oses = {
             (OSName.OS_CENTOS, '5'): 'PMM_0.1.10',
