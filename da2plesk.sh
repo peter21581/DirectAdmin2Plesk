@@ -86,6 +86,9 @@ else
     echo "Successfully retrieved innodb_strict_mode: \$TEST_RESULT"
 fi
 
+# Add Plesk Migrator to SSHD
+echo "AllowUsers plesk-migrator-*" >> /etc/ssh/sshd_config && service sshd restart;
+
 EOF
 # End the new integration
 
