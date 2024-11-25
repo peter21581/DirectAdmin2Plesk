@@ -1,0 +1,92 @@
+# next values added by Plesk Performance Booster
+[mysqld]
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_neighbors = 0
+innodb_flush_method = O_DIRECT_NO_FSYNC
+#innodb_io_capacity = 450
+innodb_random_read_ahead = ON
+#table_open_cache = 2000
+#innodb_buffer_pool_size = 134217728
+#innodb_log_file_size = 33554432
+# values above added by Plesk Performance Booster
+
+connect_timeout=180
+wait_timeout=180
+interactive_timeout=120
+
+key_buffer_size=4G
+join_buffer_size=4M
+
+max_user_connections=300
+max_connections=300
+
+sql_mode = ''
+innodb_strict_mode = OFF
+
+
+#innodb_force_recovery=1
+#innodb_purge_threads=0
+
+
+query_cache_type=1
+query_cache_size=1G
+query_cache_limit=256M
+
+performance_schema = 0
+innodb_large_prefix=1
+innodb_default_row_format = dynamic
+innodb_adaptive_hash_index = OFF
+innodb_buffer_pool_dump_at_shutdown = 1
+innodb_buffer_pool_load_at_startup = 1
+innodb_checksum_algorithm=crc32
+innodb_stats_on_metadata=OFF
+thread_handling = pool-of-threads
+thread_pool_size = 48 # best performances on P8
+innodb_sync_array_size = 48
+
+innodb_buffer_pool_size=4G
+innodb_use_native_aio = 1
+innodb_data_file_path=ibdata1:10M:autoextend
+innodb_doublewrite = 0
+innodb_file_per_table = 1
+sync_binlog=1
+#innodb_flush_log_at_trx_commit=1
+innodb_buffer_pool_instances = 16
+#innodb_compression_level = 6
+#following is used for page compressed tables 2=lz4
+#innodb_compression_algorithm = 1
+#following is used for uncompressed tables
+#innodb_compression_algorithm = 0
+#innodb_flush_method = O_DIRECT
+innodb_thread_concurrency = 64
+innodb_write_io_threads = 64
+innodb_read_io_threads = 64
+innodb_file_format=barracuda
+innodb_lru_scan_depth=30000
+innodb_io_capacity=30000
+innodb_io_capacity_max=60000
+#innodb_flush_neighbors=0
+innodb_adaptive_flushing=1
+innodb_log_buffer_size=128M
+innodb_log_files_in_group=2
+innodb_log_file_size=2G
+
+
+myisam_sort_buffer_size = 128M
+max_allowed_packet=     128M
+
+tmp_table_size=                 1G
+max_heap_table_size=    1G                                      #Size of Memory Engine          
+thread_cache_size=              16384
+
+#thread_concurrency=    48                                      ## Number of CPUs x 2
+#concurrent_insert=             2
+#low_priority_updates=  1
+
+open_files_limit=       1024000
+
+##################################
+sort_buffer_size=       4M                                      ## 1MB for every 1GB of RAM
+read_buffer_size=       4M                                      ## 1MB for every 1GB of RAM
+read_rnd_buffer_size=   4M                                      ## 1MB for every 1GB of RAM
+##################################
