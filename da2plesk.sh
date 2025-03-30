@@ -92,8 +92,13 @@ echo "AllowUsers plesk-migrator-*" >> /etc/ssh/sshd_config && service sshd resta
 EOF
 # End the new integration
 
+#remove current plesk-migrator
 plesk bin extension --uninstall panel-migrator
-plesk bin extension --install panel-migrator
+#plesk bin extension --install panel-migrator
+#download the working version of plesk-migrator - we have mirror in this reo
+wget -O /tmp/panel-migrator-2.25.6-1356-custom.zip https://support.plesk.com/hc/en-us/article_attachments/28201935612695;
+plesk bin extension -i /tmp/panel-migrator-2.25.6-1356-custom.zip;
+
 echo -e "[client]\nuser=admin\npassword=$(cat /etc/psa/.psa.shadow)\nsocket=/var/lib/mysql/mysql.sock" > /root/.my.cnf
 
 download_files() {
