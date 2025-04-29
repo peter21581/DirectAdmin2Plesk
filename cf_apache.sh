@@ -3,14 +3,16 @@
 # check if /etc/http or /etc/apache2 exists
 if [ -d /etc/httpd ]; then
     httpd_dir=/etc/httpd
+    conf_dir=$httpd_dir/conf.d
 elif [ -d /etc/apache2 ]; then
     httpd_dir=/etc/apache2
+    conf_dir=$httpd_dir/conf-enabled
 else
     echo "Apache config directory not found. Exiting..."
     exit 1
 fi
 
-cat <<EOF > $httpd_dir/conf.d/cloudflare.conf
+cat <<EOF > $conf_dir/cloudflare.conf
 RemoteIPHeader CF-Connecting-IP
 RemoteIPTrustedProxy 173.245.48.0/20
 RemoteIPTrustedProxy 103.21.244.0/22
