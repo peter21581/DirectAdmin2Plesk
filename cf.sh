@@ -23,6 +23,7 @@ sed -i '/[^;] *$/s/$/;/' $CFTEMP
 
 placeconf(){
 	mv $CFTEMP /etc/nginx/conf.d/cloudflare.conf
+	chmod 644 /etc/nginx/conf.d/cloudflare.conf
 }
 
 
@@ -43,9 +44,9 @@ if [[ $? == 0 ]]; then
  	echo "Configuration applied. Restarting Nginx."
  	systemctl restart nginx
 else
- 	# Configuration is not valid. Switching to the old CF IP list
- 	echo "Nginx conf test failed. Rolling back"
+ 	# Configuration is not valid. Switching to the old CF IP list 	echo "Nginx conf test failed. Rolling back"
  	mv /etc/nginx/conf.d/cloudflare.conf.bkp /etc/nginx/conf.d/cloudflare.conf
+ 	chmod 644 /etc/nginx/conf.d/cloudflare.conf
  	t2=$(nginx -t 2>/dev/null > /dev/null)
  	if [ "$t2" == 0 ] ; then
  		# Previous config is valid. Restarting.
