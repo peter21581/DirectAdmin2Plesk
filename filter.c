@@ -150,12 +150,40 @@ struct {
 }
 defense_mode SEC(".maps");
 
-// stats[0]=pass 1=drop 2=challenge_sent 3=blackholed, for monitoring/dashboards
+// Stats indices, for monitoring/dashboards (see monitor.py). 0-3 are the
+// original aggregate counters, kept stable; 4+ add protocol- and reason-level
+// breakdown. NOTE: established TCP traffic (non-SYN packets that aren't
+// otherwise dropped) deliberately bumps NOTHING here — that's the zero-
+// added-latency guarantee for the bulk of TCP traffic, so ST_TCP_PASS only
+// reflects new-connection (SYN) admissions, not total TCP volume.
+#define ST_PASS 0 // aggregate pass
+#define ST_DROP 1 // aggregate drop
+#define ST_CHALLENGE 2 // UDP challenge sent (XDP_TX)
+#define ST_BLACKHOLE 3 // IP newly entered blackhole (event, not per-packet)
+#define ST_UDP_PASS 4
+#define ST_UDP_DROP 5
+#define ST_TCP_PASS 6 // SYN admissions only — see note above
+#define ST_TCP_DROP 7
+#define ST_TCP_SYN 8 // new-connection attempts seen (pass + drop)
+#define ST_ICMP_PASS 9
+#define ST_ICMP_DROP 10
+#define ST_OTHER_PASS 11 // GRE/ESP/AH/SUN-ND/IGMP/OSPF/etc.
+#define ST_OTHER_DROP 12
+#define ST_FRAG_DROP 13 // IP fragment / evil-bit
+#define ST_BOGON_DROP 14 // bogon source address
+#define ST_GARBAGE_DROP 15 // chargen-style ASCII garbage flood
+#define ST_AMP_DROP 16 // ENABLE_AMP_PROTECTION reflection/amplification
+#define ST_REFLECT_DROP 17 // reflected privileged UDP source port
+#define ST_BADFLAGS_DROP 18 // invalid TCP flag combination
+#define ST_EXPLOIT_DROP 19 // GAME_RAN known-bad TCP payload
+#define ST_RATELIMIT_DROP 20 // adaptive per-IP pps limit exceeded
+#define ST_COUNT 21
+
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __type(key, __u32);
   __type(value, __u64);
-  __uint(max_entries, 4);
+  __uint(max_entries, ST_COUNT);
 }
 stats SEC(".maps");
 
@@ -427,7 +455,7 @@ static inline int rate_limited(__u32 src_ip, __u64 now, __u32 weight) {
     st -> pkt_count += weight;
     if (st -> pkt_count > limit) {
       st -> blackhole_until = now + BLACKHOLE_NS;
-      bump_stat(3);
+      bump_stat(ST_BLACKHOLE);
       return 1;
     }
     return 0;
@@ -622,7 +650,8 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
     // common evasion/DoS vector. Single field check, no map access.
     __u16 frag = bpf_ntohs(ip -> frag_off);
     if ((frag & 0x2000) || (frag & 0x1fff) || (frag & 0x8000)) {
-      bump_stat(1);
+      bump_stat(ST_DROP);
+      bump_stat(ST_FRAG_DROP);
       return XDP_DROP;
     }
 
@@ -630,7 +659,8 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
     // link-local/CGNAT/documentation/multicast/reserved space. Applies to
     // every protocol, before any protocol-specific dispatch.
     if (is_bogon_source(ip -> saddr)) {
-      bump_stat(1);
+      bump_stat(ST_DROP);
+      bump_stat(ST_BOGON_DROP);
       return XDP_DROP;
     }
 
@@ -639,13 +669,17 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       if ((void * )(udp + 1) > data_end) return XDP_PASS;
 
       if (is_ascii_garbage_flood((void * )(udp + 1), data_end)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_GARBAGE_DROP);
         return XDP_DROP;
       }
 
 #ifdef ENABLE_AMP_PROTECTION
       if (is_amp_flood(udp, data_end, ip -> saddr)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_AMP_DROP);
         return XDP_DROP;
       }
 #endif
@@ -661,7 +695,9 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       // DNS is excluded: legitimate server-to-server DNS often uses sport 53.
       __u16 sport = bpf_ntohs(udp -> source);
       if (dport != 53 && sport != 0 && sport < 1024) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_REFLECT_DROP);
         return XDP_DROP;
       }
 
@@ -670,14 +706,17 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 
       // Adaptivni rate limit / auto-blackhole, pre svega ostalog
       if (rate_limited(src_ip, ts, 1)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_RATELIMIT_DROP);
         return XDP_DROP;
       }
 
       // Proveri whitelist
       __u64 * wl_ts = bpf_map_lookup_elem( & whitelist, & src_ip);
       if (wl_ts && ts - * wl_ts < 180000000000ULL) { // 180 sekundi whitelist
-        bump_stat(0);
+        bump_stat(ST_PASS);
+        bump_stat(ST_UDP_PASS);
         return XDP_PASS;
       }
 
@@ -691,7 +730,8 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         if (ch && ch -> cookie == * maybe_cookie && ts - ch -> timestamp < 5000000000ULL) { // 5s
           bpf_map_update_elem( & whitelist, & src_ip, & ts, BPF_ANY);
           bpf_map_delete_elem( & challenge_sent, & src_ip);
-          bump_stat(0);
+          bump_stat(ST_PASS);
+          bump_stat(ST_UDP_PASS);
           return XDP_PASS;
         }
       }
@@ -745,11 +785,12 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
           return XDP_DROP;
         * cookie_out = cookie;
 
-        bump_stat(2);
+        bump_stat(ST_CHALLENGE);
         return XDP_TX;
       }
 
-      bump_stat(1);
+      bump_stat(ST_DROP);
+      bump_stat(ST_UDP_DROP);
       return XDP_DROP;
     }
 
@@ -759,14 +800,18 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       if ((void * )(tcp + 1) > data_end) return XDP_PASS;
 
       if (bogus_tcp_flags(tcp)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_TCP_DROP);
+        bump_stat(ST_BADFLAGS_DROP);
         return XDP_DROP;
       }
 
 #ifdef GAME_RAN
       void * tcp_payload = (void * ) tcp + (tcp -> doff * 4); // account for TCP options
       if (is_known_bad_tcp_payload(tcp_payload, data_end)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_TCP_DROP);
+        bump_stat(ST_EXPLOIT_DROP);
         return XDP_DROP;
       }
 #endif
@@ -774,15 +819,21 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       // Per-IP SYN-flood protection, sve TCP portove (SSH, panel, FiveM/RedM
       // init, itd). Samo novi handshake pokušaji (SYN bez ACK) diraju mapu —
       // uspostavljene konekcije prolaze odmah, bez ikakvog dodatnog lookup-a
-      // ili kašnjenja.
+      // ili kašnjenja. Established/data packets bump NOTHING here — that's
+      // the zero-added-latency guarantee, so ST_TCP_PASS only ever reflects
+      // SYN admissions, never the bulk established-connection volume.
       if (tcp -> syn && !tcp -> ack) {
+        bump_stat(ST_TCP_SYN);
         __u32 src_ip = ip -> saddr;
         __u64 ts = bpf_ktime_get_ns();
         if (rate_limited(src_ip, ts, syn_weight(ip, tcp))) {
-          bump_stat(1);
+          bump_stat(ST_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_RATELIMIT_DROP);
           return XDP_DROP;
         }
-        bump_stat(0);
+        bump_stat(ST_PASS);
+        bump_stat(ST_TCP_PASS);
       }
     }
 
@@ -792,10 +843,13 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();
       if (rate_limited(src_ip, ts, 1)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_ICMP_DROP);
+        bump_stat(ST_RATELIMIT_DROP);
         return XDP_DROP;
       }
-      bump_stat(0);
+      bump_stat(ST_PASS);
+      bump_stat(ST_ICMP_PASS);
     }
 
 #ifdef ENABLE_GRE
@@ -815,7 +869,8 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       gre_trusted = gre_trusted && (ip -> daddr == GRE_ALLOWED_DST);
 #endif
       if (gre_trusted) {
-        bump_stat(0);
+        bump_stat(ST_PASS);
+        bump_stat(ST_OTHER_PASS);
         return XDP_PASS;
       }
     }
@@ -833,10 +888,13 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();
       if (rate_limited(src_ip, ts, 1)) {
-        bump_stat(1);
+        bump_stat(ST_DROP);
+        bump_stat(ST_OTHER_DROP);
+        bump_stat(ST_RATELIMIT_DROP);
         return XDP_DROP;
       }
-      bump_stat(0);
+      bump_stat(ST_PASS);
+      bump_stat(ST_OTHER_PASS);
     }
   }
 

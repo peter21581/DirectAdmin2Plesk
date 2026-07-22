@@ -10,6 +10,8 @@ amplification defense (DNS/NTP/memcached/SSDP/chargen/etc.).
 
 One binary = one server. You pick which games/services this specific box
 runs at **compile time**, then attach the resulting program to its interface.
+`monitor.py` (see [Monitoring](#monitoring)) gives you a live dashboard or a
+Prometheus export of what it's doing.
 
 ## Requirements
 
@@ -238,21 +240,76 @@ inbound-answer side needed the exemption above.
 
 ## Monitoring
 
-The `stats` map (`BPF_MAP_TYPE_PERCPU_ARRAY`, 4 entries) is meant for a
-userspace exporter (Prometheus/Grafana):
+Two ways to look at what the filter is doing: raw `bpftool` for one-off
+checks, or `monitor.py` for a live dashboard / Prometheus export.
 
-| Index | Meaning |
-|---|---|
-| 0 | passed |
-| 1 | dropped |
-| 2 | challenge sent |
-| 3 | blackholed |
+### The `stats` map directly
 
-It's per-CPU — sum across CPUs for the total. Read with:
+`BPF_MAP_TYPE_PERCPU_ARRAY`, 21 entries (constants named `ST_*` at the top
+of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
+
+| Index | Name | Meaning |
+|---|---|---|
+| 0 | `ST_PASS` | aggregate pass (original counter, kept stable) |
+| 1 | `ST_DROP` | aggregate drop |
+| 2 | `ST_CHALLENGE` | UDP challenge sent (`XDP_TX`) |
+| 3 | `ST_BLACKHOLE` | an IP newly *entered* blackhole (event count, not per-packet) |
+| 4-5 | `ST_UDP_PASS`/`ST_UDP_DROP` | UDP totals |
+| 6-7 | `ST_TCP_PASS`/`ST_TCP_DROP` | **new-connection (SYN) admissions only** — see caveat below |
+| 8 | `ST_TCP_SYN` | new TCP connection attempts seen (pass + drop) |
+| 9-10 | `ST_ICMP_PASS`/`ST_ICMP_DROP` | ICMP totals |
+| 11-12 | `ST_OTHER_PASS`/`ST_OTHER_DROP` | GRE/ESP/AH/SUN-ND/IGMP/OSPF/etc. |
+| 13-20 | `ST_FRAG_DROP`, `ST_BOGON_DROP`, `ST_GARBAGE_DROP`, `ST_AMP_DROP`, `ST_REFLECT_DROP`, `ST_BADFLAGS_DROP`, `ST_EXPLOIT_DROP`, `ST_RATELIMIT_DROP` | why a packet was dropped, breaking down the aggregate drop count by reason |
 
 ```bash
 sudo bpftool map dump name stats
 ```
+
+**Caveat on `ST_TCP_PASS`**: it only counts new connections (SYN packets)
+allowed through. Established/data TCP packets bump nothing at all — that's
+the zero-added-latency guarantee for the bulk of TCP traffic (repeatedly a
+hard requirement while building this). So `ST_TCP_PASS` is "new connections
+admitted," not "TCP packets passed." There's no way to count the latter
+without adding a map write to every established-connection packet, which
+would undo that guarantee — not done here on purpose.
+
+**Scope of "incoming/outgoing" and "TCP state"**: this program is XDP
+ingress-only — it never sees or touches outbound traffic, so there's no
+"outgoing" counter to report; use `ip -s link show dev <iface>` or
+vnstat/iftop for actual bandwidth in both directions. Similarly, "TCP state"
+here is limited to what filter.c actually tracks (new-connection attempts
+and their outcome) — the real TCP state machine (ESTABLISHED, TIME_WAIT,
+etc.) lives in the kernel's connection tracking, not in this filter; use
+`ss -s` / `ss -tan` for that.
+
+### `monitor.py` — TUI and Prometheus export
+
+A small script that reads the maps above via `bpftool` and shows them as a
+live terminal dashboard or a Prometheus-scrapable HTTP endpoint. Run it ON
+the box where `filter.c` is attached (needs `bpftool` and root/`CAP_BPF`).
+
+```bash
+python3 monitor.py --tui                    # live terminal dashboard
+python3 monitor.py --once                   # single text snapshot
+python3 monitor.py --once --json            # single JSON snapshot
+python3 monitor.py --serve 0.0.0.0:9107     # Prometheus /metrics for Grafana
+```
+
+It shows: pass/drop totals and per-protocol breakdown with live rates,
+the drop-reason breakdown table above, current defense mode, the list of
+currently **blackholed ("bad") IPs** (from `rl_state`, sorted by packet
+count, with time until unblock) and the count of currently **whitelisted
+("good") IPs** (from `whitelist` — challenge-passed, still within the
+180-second trust window).
+
+Caveat: `monitor.py` was written and logic-tested against synthetic fixture
+data (no Linux/eBPF environment was available to test it against real
+`bpftool` output). The map-parsing assumptions — particularly the raw
+struct layout of `rl_state`'s values — matched a set of constructed test
+cases, but `bpftool`'s exact JSON shape has varied across versions. Run
+`python3 monitor.py --debug-raw <map-name>` first on the real box and
+compare against what `to_bytes()`/the struct formats in the script expect;
+adjust if your `bpftool` emits something different.
 
 ## Defense mode
 
