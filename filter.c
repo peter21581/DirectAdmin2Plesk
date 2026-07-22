@@ -89,6 +89,8 @@ static inline int is_legit_port(__u16 dport) {
   if (dport >= 22000 && dport <= 22126) return 1;
   if (dport >= 27000 && dport <= 27500) return 1;
   if (dport >= 30000 && dport <= 32000) return 1;
+  if (dport == 19132) return 1; // Minecraft Bedrock
+  if (dport >= 25565 && dport <= 25575) return 1; // Minecraft Java (+ GS4 query)
   return 0;
 }
 
@@ -184,6 +186,15 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
   if (dport >= 27000 && dport <= 27500) return data + 4 <= data_end && * (__u32 * ) data == 0xffffffff;
   // RakNet (Rust, Unturned)
   if (dport == 28015) return data + 1 <= data_end && * (char * ) data == '\x05'; // offline message
+  // Minecraft Bedrock (RakNet unconnected ping, dedicated port — strict gate)
+  if (dport == 19132) {
+    if (data + 1 > data_end) return 0;
+    __u8 first = * (__u8 * ) data;
+    return first == 0x01 || first == 0x02; // ID_UNCONNECTED_PING(_OPEN_CONNECTIONS)
+  }
+  // Minecraft Java GS4 query protocol (dedicated range — strict gate)
+  if (dport >= 25565 && dport <= 25575)
+    return data + 2 <= data_end && * (__u16 * ) data == 0xfdfe; // 0xFE 0xFD magic, little-endian read
   // TeamSpeak 3 (client-to-server handshake starts with magic "TS3INIT1")
   if (dport >= TS3_PORT_MIN && dport <= TS3_PORT_MAX)
     return data + 8 <= data_end && bpf_strncmp(data, 8, "TS3INIT1") == 0;
@@ -192,6 +203,13 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
     if (data + 1 > data_end) return 0;
     __u8 first = * (__u8 * ) data;
     if (first == 0x01 || first == 0x02) return 1;
+  }
+
+  // SAMP (San Andreas Multiplayer) query, shares default port 7777 with the
+  // block above — magic "SAMP" prefix.
+  if (dport == 7777) {
+    if (data + 4 <= data_end && bpf_strncmp(data, 4, "SAMP") == 0)
+      return 1;
   }
 
   // AltV (obično 7788 UDP, ali i u 7000-8999 range)
