@@ -134,8 +134,10 @@ static inline __u16 ip_checksum(struct iphdr * ip) {
 }
 
 // Adaptivni per-IP rate limit. Vraća 1 ako paket treba dropovati
-// (blackholed ili je IP prešao limit za trenutni defense mode).
-static inline int rate_limited(__u32 src_ip, __u64 now) {
+// (blackholed ili je IP prešao limit za trenutni defense mode). `weight`
+// lets a caller spend more of the shared budget per packet (e.g. a SYN whose
+// TCP/IP shape doesn't look like a real client stack).
+static inline int rate_limited(__u32 src_ip, __u64 now, __u32 weight) {
   __u32 mkey = 0;
   __u32 * mode = bpf_map_lookup_elem( & defense_mode, & mkey);
   __u32 idx = 0;
@@ -148,11 +150,11 @@ static inline int rate_limited(__u32 src_ip, __u64 now) {
       return 1;
     if (now - st -> window_start > RL_WINDOW_NS) {
       st -> window_start = now;
-      st -> pkt_count = 1;
+      st -> pkt_count = weight;
       st -> blackhole_until = 0;
       return 0;
     }
-    st -> pkt_count++;
+    st -> pkt_count += weight;
     if (st -> pkt_count > limit) {
       st -> blackhole_until = now + BLACKHOLE_NS;
       bump_stat(3);
@@ -163,11 +165,24 @@ static inline int rate_limited(__u32 src_ip, __u64 now) {
 
   struct ip_state new_st = {
     .window_start = now,
-    .pkt_count = 1,
+    .pkt_count = weight,
     .blackhole_until = 0
   };
   bpf_map_update_elem( & rl_state, & src_ip, & new_st, BPF_ANY);
   return 0;
+}
+
+// Rough p0f-style OS bucketing from the SYN's own IP/TCP header — not full
+// signature matching (see pf.os), just "does this look like a real client
+// stack, and is it Windows-shaped (the common case) or not". Real player
+// traffic skews Windows; non-Windows-shaped or implausible SYNs get a
+// stricter share of the same per-IP budget.
+static inline __u32 syn_weight(struct iphdr * ip, struct tcphdr * tcp) {
+  if (ip -> ttl > 250 || bpf_ntohs(tcp -> window) == 0)
+    return 50; // implausible for any real stack — burn the budget in one hit
+  if (ip -> ttl <= 64) return 4; // Linux/BSD/macOS-shaped — less common for players
+  if (ip -> ttl <= 128) return 1; // Windows-shaped — generous, matches typical player base
+  return 4; // rare bucket (router/embedded/Solaris-shaped) — stricter
 }
 
 // Provera da li je payload "legit" za određeni protokol (prvih par bajtova)
@@ -315,7 +330,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       __u64 ts = bpf_ktime_get_ns();
 
       // Adaptivni rate limit / auto-blackhole, pre svega ostalog
-      if (rate_limited(src_ip, ts)) {
+      if (rate_limited(src_ip, ts, 1)) {
         bump_stat(1);
         return XDP_DROP;
       }
@@ -416,7 +431,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       if (tcp -> syn && !tcp -> ack) {
         __u32 src_ip = ip -> saddr;
         __u64 ts = bpf_ktime_get_ns();
-        if (rate_limited(src_ip, ts)) {
+        if (rate_limited(src_ip, ts, syn_weight(ip, tcp))) {
           bump_stat(1);
           return XDP_DROP;
         }
@@ -429,7 +444,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
     if (ip -> protocol == IPPROTO_ICMP) {
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();
-      if (rate_limited(src_ip, ts)) {
+      if (rate_limited(src_ip, ts, 1)) {
         bump_stat(1);
         return XDP_DROP;
       }
