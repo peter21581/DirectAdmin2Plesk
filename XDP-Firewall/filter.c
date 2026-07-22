@@ -8,6 +8,13 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+// XDP_PASS *is* the real kernel-defined verdict (from <linux/bpf.h>) — this
+// is just a clearer name for the "explicitly let this through" cases below
+// (runtime allowlist, trusted GRE peer, etc.), as opposed to "PASS" reading
+// like a no-decision default. Compiles to the exact same value; XDP_DROP
+// needs no such alias since "drop" is already unambiguous.
+#define XDP_ACCEPT XDP_PASS
+
 // Builds a dotted-quad IPv4 address into the same in-memory representation
 // as ip->saddr/ip->daddr (raw network byte order), so it can be compared
 // directly with == . Used by GRE_ALLOWED_SRC/GRE_ALLOWED_DST and the known-
@@ -139,6 +146,45 @@ struct {
 }
 rl_state SEC(".maps");
 
+// LPM (longest-prefix-match) key for the runtime allow/block lists below.
+// prefixlen MUST be the first field (BPF_MAP_TYPE_LPM_TRIE requirement).
+// addr is a plain IPv4 address in the same raw network-byte-order layout as
+// ip->saddr — a /32 entry is just prefixlen=32 with the exact address; a
+// CIDR block (including one of the many individual prefixes an ASN or
+// country resolves to) is prefixlen=<mask> with the network address.
+struct ip_key {
+  __u32 prefixlen;
+  __u32 addr;
+};
+
+// Runtime allowlist — checked first, before every other check in this
+// program (fragment/bogon/rate-limit/everything). Populated/depopulated at
+// runtime via xdpctl.py (bpftool map update/delete), independent IP/32,
+// CIDR, ASN (resolved to its announced prefixes), or country (resolved to
+// its aggregate CIDR blocks) — the kernel side only ever does one LPM
+// lookup; ASN/country are a userspace-side prefix expansion, not something
+// XDP can look up on its own.
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, struct ip_key);
+  __type(value, __u8); // tag: 1=manual 2=asn 3=country, for `xdpctl.py list`
+  __uint(max_entries, 200000);
+}
+runtime_allow SEC(".maps");
+
+// Runtime blocklist — checked second (after the allowlist, so an allow
+// entry always wins over a block entry for the same address), before
+// everything else. Same key/tag scheme as runtime_allow.
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, struct ip_key);
+  __type(value, __u8);
+  __uint(max_entries, 1000000);
+}
+runtime_block SEC(".maps");
+
 // Defense mode: 0=normal 1=elevated 2=critical.
 // Written by an external controller (userspace daemon reading `stats`,
 // e.g. a Prometheus exporter) based on aggregate attack intensity.
@@ -177,7 +223,9 @@ defense_mode SEC(".maps");
 #define ST_BADFLAGS_DROP 18 // invalid TCP flag combination
 #define ST_EXPLOIT_DROP 19 // GAME_RAN known-bad TCP payload
 #define ST_RATELIMIT_DROP 20 // adaptive per-IP pps limit exceeded
-#define ST_COUNT 21
+#define ST_RUNTIME_ALLOW 21 // matched runtime_allow (IP/CIDR/ASN/country)
+#define ST_RUNTIME_BLOCK 22 // matched runtime_block (IP/CIDR/ASN/country)
+#define ST_COUNT 23
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -639,11 +687,33 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
   void * data_end = (void * )(long) ctx -> data_end;
 
   struct ethhdr * eth = data;
-  if (data + sizeof( * eth) > data_end) return XDP_PASS;
+  if (data + sizeof( * eth) > data_end) return XDP_ACCEPT;
 
   if (eth -> h_proto == bpf_htons(ETH_P_IP)) {
     struct iphdr * ip = data + sizeof( * eth);
-    if ((void * ) & ip[1] > data_end) return XDP_PASS;
+    if ((void * ) & ip[1] > data_end) return XDP_ACCEPT;
+
+    // Runtime allow/block lists (xdpctl.py) — checked first, ahead of every
+    // other check in this program, including the bogon filter below. An
+    // allow entry always wins over a block entry for the same address
+    // (checked first); a match here skips fragment/bogon/rate-limit/
+    // everything else entirely, in both directions.
+    {
+      struct ip_key key = {
+        .prefixlen = 32,
+        .addr = ip -> saddr
+      };
+      if (bpf_map_lookup_elem( & runtime_allow, & key)) {
+        bump_stat(ST_PASS);
+        bump_stat(ST_RUNTIME_ALLOW);
+        return XDP_ACCEPT;
+      }
+      if (bpf_map_lookup_elem( & runtime_block, & key)) {
+        bump_stat(ST_DROP);
+        bump_stat(ST_RUNTIME_BLOCK);
+        return XDP_DROP;
+      }
+    }
 
     // Drop fragments and the reserved/"evil" bit: none of the protocols this
     // program inspects fragment legitimately, and fragmented floods are a
@@ -666,7 +736,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 
     if (ip -> protocol == IPPROTO_UDP) {
       struct udphdr * udp = (void * )(ip + 1);
-      if ((void * )(udp + 1) > data_end) return XDP_PASS;
+      if ((void * )(udp + 1) > data_end) return XDP_ACCEPT;
 
       if (is_ascii_garbage_flood((void * )(udp + 1), data_end)) {
         bump_stat(ST_DROP);
@@ -686,7 +756,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 
       __u16 dport = bpf_ntohs(udp -> dest);
 
-      if (!is_legit_port(dport)) return XDP_PASS; // nije naš port → kernel
+      if (!is_legit_port(dport)) return XDP_ACCEPT; // nije naš port → kernel
 
       // Reflected/amplified UDP (memcached, NTP monlist, chargen, SSDP, ...)
       // always arrives from a privileged source port. Real game/voice/VPN
@@ -717,7 +787,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       if (wl_ts && ts - * wl_ts < 180000000000ULL) { // 180 sekundi whitelist
         bump_stat(ST_PASS);
         bump_stat(ST_UDP_PASS);
-        return XDP_PASS;
+        return XDP_ACCEPT;
       }
 
       void * payload = (void * )(udp + 1);
@@ -732,7 +802,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
           bpf_map_delete_elem( & challenge_sent, & src_ip);
           bump_stat(ST_PASS);
           bump_stat(ST_UDP_PASS);
-          return XDP_PASS;
+          return XDP_ACCEPT;
         }
       }
 
@@ -795,9 +865,9 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
     }
 
     if (ip -> protocol == IPPROTO_TCP) {
-      if (ip -> ihl < 5) return XDP_PASS; // malformed header
+      if (ip -> ihl < 5) return XDP_ACCEPT; // malformed header
       struct tcphdr * tcp = (void * ) ip + (ip -> ihl * 4); // account for IP options
-      if ((void * )(tcp + 1) > data_end) return XDP_PASS;
+      if ((void * )(tcp + 1) > data_end) return XDP_ACCEPT;
 
       if (bogus_tcp_flags(tcp)) {
         bump_stat(ST_DROP);
@@ -871,7 +941,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       if (gre_trusted) {
         bump_stat(ST_PASS);
         bump_stat(ST_OTHER_PASS);
-        return XDP_PASS;
+        return XDP_ACCEPT;
       }
     }
 #endif
@@ -898,7 +968,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
     }
   }
 
-  return XDP_PASS;
+  return XDP_ACCEPT;
 }
 
 char _license[] SEC("license") = "GPL";

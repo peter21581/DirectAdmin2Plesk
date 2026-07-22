@@ -11,15 +11,54 @@ amplification defense (DNS/NTP/memcached/SSDP/chargen/etc.).
 One binary = one server. You pick which games/services this specific box
 runs at **compile time**, then attach the resulting program to its interface.
 `monitor.py` (see [Monitoring](#monitoring)) gives you a live dashboard or a
-Prometheus export of what it's doing.
+Prometheus export of what it's doing, and `xdpctl.py` (see [Runtime allow/
+block lists](#runtime-allowblock-lists)) lets you add/remove trusted or
+blocked IPs, CIDR blocks, whole ASNs, or whole countries without rebuilding
+or reattaching anything.
+
+## Folder layout
+
+Everything lives in this `XDP-Firewall/` folder:
+
+| File | What it is |
+|---|---|
+| `filter.c` | the XDP program itself — build and attach this |
+| `install.sh` | one-time dependency installer (Debian/Ubuntu or AlmaLinux/RHEL/Rocky) |
+| `monitor.py` | read-only live dashboard / Prometheus exporter |
+| `xdpctl.py` | runtime allow/block-list manager (IP/CIDR/ASN/country) |
+| `FILTER.md` | this file |
+
+Run everything below from inside this folder.
+
+## 0. Install dependencies
+
+```bash
+sudo ./install.sh
+```
+
+Detects Debian/Ubuntu (`apt`) vs. AlmaLinux/RHEL/Rocky/CentOS (`dnf`/`yum`)
+via `/etc/os-release` and installs: `clang`/LLVM, `libbpf` headers,
+`bpftool`, matching kernel headers, `iproute2`, `python3`, and `curl`
+(needed by `xdpctl.py`'s ASN/country lookups). Prints a final OK/MISSING
+check for each required binary so you can see immediately if anything needs
+installing by hand. Only installs dependencies — it doesn't build or attach
+`filter.c` itself.
+
+Caveat: written and reviewed carefully, but not run end-to-end on a real
+Debian or AlmaLinux box (no such environment was available while writing
+it) — read it before running with root, same as any installer script.
 
 ## Requirements
 
-- Linux kernel 4.18+ (Debian 12 "bookworm" and Debian 13 "trixie" both fine —
-  nothing here needs BTF/CO-RE or a specific `vmlinux.h`)
+(handled by `install.sh` above — listed here for reference)
+
+- Linux kernel 4.18+ (Debian 12 "bookworm" and Debian 13 "trixie", and
+  AlmaLinux 9/10, are all fine — nothing here needs BTF/CO-RE or a specific
+  `vmlinux.h`)
 - `clang`/LLVM with BPF target support
 - `libbpf` headers (`bpf/bpf_helpers.h`, `bpf/bpf_endian.h`)
 - `bpftool` (for loading, inspecting maps, detaching)
+- `python3` and `curl` (for `monitor.py`/`xdpctl.py`)
 - A NIC/driver that supports native XDP for best performance (falls back to
   generic/SKB-mode XDP automatically if not — still works, just slower)
 
@@ -119,6 +158,9 @@ Re-run the attach command after every rebuild — there's no hot-reload.
 
 ## Runtime behavior (always on, regardless of flags)
 
+- **Runtime allow/block lists, checked first** — before fragment/bogon/
+  rate-limit/everything else. Manage with `xdpctl.py` (see below); empty by
+  default, so this adds nothing until you add an entry.
 - Drops IP fragments and the reserved/"evil" bit — none of the supported
   protocols fragment legitimately.
 - Drops any packet whose source address is bogon/special-use space (RFC1918
@@ -142,7 +184,7 @@ Re-run the attach command after every rebuild — there's no hot-reload.
 - Rate limiting (same shared per-IP budget) for **any other IP protocol** —
   ESP, AH, SUN-ND, IGMP, OSPF, GRE (unless `ENABLE_GRE`, see below), or an
   outright bogus protocol number. Previously these all fell through to an
-  unconditional, unlimited `XDP_PASS` since only UDP/TCP/ICMP were handled
+  unconditional, unlimited `XDP_ACCEPT` since only UDP/TCP/ICMP were handled
   at all.
 - Reflected UDP privileged-source-port block: any UDP packet with a source
   port under 1024 (except `sport 53`, to allow real server-to-server DNS)
@@ -245,7 +287,7 @@ checks, or `monitor.py` for a live dashboard / Prometheus export.
 
 ### The `stats` map directly
 
-`BPF_MAP_TYPE_PERCPU_ARRAY`, 21 entries (constants named `ST_*` at the top
+`BPF_MAP_TYPE_PERCPU_ARRAY`, 23 entries (constants named `ST_*` at the top
 of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 
 | Index | Name | Meaning |
@@ -260,6 +302,8 @@ of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 | 9-10 | `ST_ICMP_PASS`/`ST_ICMP_DROP` | ICMP totals |
 | 11-12 | `ST_OTHER_PASS`/`ST_OTHER_DROP` | GRE/ESP/AH/SUN-ND/IGMP/OSPF/etc. |
 | 13-20 | `ST_FRAG_DROP`, `ST_BOGON_DROP`, `ST_GARBAGE_DROP`, `ST_AMP_DROP`, `ST_REFLECT_DROP`, `ST_BADFLAGS_DROP`, `ST_EXPLOIT_DROP`, `ST_RATELIMIT_DROP` | why a packet was dropped, breaking down the aggregate drop count by reason |
+| 21 | `ST_RUNTIME_ALLOW` | matched an `xdpctl.py`-managed allowlist entry (IP/CIDR/ASN/country) |
+| 22 | `ST_RUNTIME_BLOCK` | matched an `xdpctl.py`-managed blocklist entry |
 
 ```bash
 sudo bpftool map dump name stats
@@ -311,6 +355,53 @@ cases, but `bpftool`'s exact JSON shape has varied across versions. Run
 compare against what `to_bytes()`/the struct formats in the script expect;
 adjust if your `bpftool` emits something different.
 
+## Runtime allow/block lists
+
+`xdpctl.py` adds and removes entries in two `BPF_MAP_TYPE_LPM_TRIE` maps —
+`runtime_allow` and `runtime_block` — while `filter.c` keeps running. No
+rebuild, no reattach. These are checked **first**, before fragment/bogon/
+rate-limit/everything else, and an allow entry always wins over a block
+entry for the same address.
+
+```bash
+python3 xdpctl.py allow 203.0.113.5          # single IP (implicit /32)
+python3 xdpctl.py allow 203.0.113.0/24       # CIDR block
+python3 xdpctl.py block 198.51.100.7
+python3 xdpctl.py unallow 203.0.113.5        # remove an allow entry
+python3 xdpctl.py unblock 198.51.100.7       # remove a block entry
+
+python3 xdpctl.py allow-asn 15169            # every prefix Google (AS15169) currently announces
+python3 xdpctl.py block-asn 64500
+
+python3 xdpctl.py allow-country US           # every aggregate CIDR block for a country
+python3 xdpctl.py block-country CN
+
+python3 xdpctl.py list-allow                 # what's actually in the map right now
+python3 xdpctl.py list-block
+```
+
+**ASN** resolution uses RIPEstat's free public API
+(`stat.ripe.net/data/announced-prefixes`) to fetch the prefixes an ASN is
+*currently* announcing — no API key needed, but it means the list can shift
+over time as routing changes; re-run periodically if you need it to stay
+current, `xdpctl.py` doesn't do this automatically.
+
+**Country** resolution uses ipdeny.com's free aggregated per-country IPv4
+zone files (`ipdeny.com/ipblocks/data/countries/<cc>.zone`) — an
+ISO 3166-1 alpha-2 code like `US`, `DE`, `TH`, `CN`. Same caveat: these are
+third-party aggregates, refreshed periodically upstream, not something
+`xdpctl.py` re-syncs on its own.
+
+Both require this box to have outbound HTTPS access to those two services.
+Everything each resolves to is IPv4 CIDR blocks under the hood — `filter.c`
+itself has no ASN or country concept; that lookup happens once, in
+userspace, at the moment you run the command.
+
+Caveat: `xdpctl.py`, like `monitor.py`, was written and logic-tested
+(the key byte-packing for `bpftool`, list parsing) against synthetic
+fixtures, not a live kernel/`bpftool`. Run `list-allow`/`list-block` right
+after adding an entry to confirm it actually landed before trusting it.
+
 ## Defense mode
 
 `defense_mode` (`BPF_MAP_TYPE_ARRAY`, 1 entry) scales the per-IP packet
@@ -328,8 +419,12 @@ sudo bpftool map update name defense_mode key 0 0 0 0 value 1 0 0 0
 
 - **Not compiled or verifier-tested on this development machine** (no
   Linux/eBPF toolchain available here). Build and load it on the real
-  Debian box with the commands above, and check `dmesg`/the verifier
-  output before relying on it in production.
+  Debian/AlmaLinux box with the commands above, and check `dmesg`/the
+  verifier output before relying on it in production. `install.sh` is
+  similarly reviewed-but-unrun end-to-end; `monitor.py`/`xdpctl.py` are
+  logic-tested against synthetic fixtures, not real `bpftool` output (both
+  scripts say so, with a `--debug-raw`/`list-*` way to check on the real
+  box).
 - `GAME_WARZ` and `GAME_TALERUNNER` are implemented (signatures decoded from
   the original iptables rules and cross-checked against public RakNet/Steam
   protocol docs for the other games — all matched byte-for-byte), but their

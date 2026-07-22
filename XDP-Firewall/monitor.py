@@ -51,6 +51,7 @@ STAT_NAMES = [
     "other_pass", "other_drop",
     "frag_drop", "bogon_drop", "garbage_drop", "amp_drop",
     "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
+    "runtime_allow", "runtime_block",  # xdpctl.py-managed IP/CIDR/ASN/country lists
 ]
 
 WHITELIST_TTL_S = 180  # must match filter.c's whitelist TTL
@@ -215,8 +216,10 @@ def print_text(snap):
     print(f"  other pass={s['other_pass']:>10} drop={s['other_drop']:>10}")
     print("  drop reasons:")
     for name in ("frag_drop", "bogon_drop", "garbage_drop", "amp_drop",
-                 "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop"):
+                 "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
+                 "runtime_block"):
         print(f"    {name:<15} {s[name]}")
+    print(f"runtime allowlist hits (xdpctl.py allow/allow-asn/allow-country): {s['runtime_allow']}")
     print(f"currently blackholed IPs: {len(snap['blackholed'])} (of {snap['tracked_ips']} tracked)")
     for e in sorted(snap["blackholed"], key=lambda x: -x["pkt_count"])[:20]:
         print(f"    {e['ip']:<16} pkt_count={e['pkt_count']:<8} unblocks in {e['blackhole_remaining_s']:.0f}s")
@@ -270,8 +273,11 @@ def run_tui(interval):
             line("")
             line("drop reasons:")
             for name in ("frag_drop", "bogon_drop", "garbage_drop", "amp_drop",
-                         "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop"):
+                         "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
+                         "runtime_block"):
                 line(f"  {name:<15} {s[name]:>10}  {r(name):>10}")
+            line(f"runtime allowlist hits: {s['runtime_allow']:>10}  {r('runtime_allow'):>10}"
+                 f"   (xdpctl.py allow/allow-asn/allow-country)")
             line("")
             bad = sorted(snap["blackholed"], key=lambda x: -x["pkt_count"])
             line(f"blackholed (bad) IPs: {len(bad)} of {snap['tracked_ips']} tracked")
