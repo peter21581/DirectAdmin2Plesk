@@ -5,6 +5,7 @@
 #include <linux/udp.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -77,6 +78,9 @@
 //   -DGRE_ALLOWED_DST='IPV4(198,51,100,9)'  // only to this local IP
 // Define either, both (both must match), or neither (trusts ALL GRE —
 // least secure, only use this if you genuinely don't know the peer IP).
+// #define ENABLE_IPIP             // this box terminates an IP-in-IP tunnel — same
+//                                  // idea and same scoping knobs as ENABLE_GRE:
+//                                  // -DIPIP_ALLOWED_SRC='IPV4(...)' / IPIP_ALLOWED_DST
 // #define ENABLE_AMP_PROTECTION  // DNS/NTP/memcached/SSDP/chargen/etc. reflection defense
 
 #if !defined(GAME_RUST) && !defined(GAME_FIVEM) && !defined(GAME_MINECRAFT) && \
@@ -86,8 +90,20 @@
   !defined(GAME_SOURCE_ENGINE) && !defined(GAME_LEGACY_MISC_PORTS) && \
   !defined(GAME_WARZ) && !defined(GAME_TALERUNNER) && !defined(GAME_RAGNAROK) && \
   !defined(ENABLE_DNS) && !defined(ENABLE_OPENVPN) && !defined(ENABLE_WIREGUARD) && \
-  !defined(ENABLE_GRE) && !defined(ENABLE_AMP_PROTECTION)
+  !defined(ENABLE_GRE) && !defined(ENABLE_IPIP) && !defined(ENABLE_AMP_PROTECTION)
 #error "Define at least one GAME_*/ENABLE_* macro before compiling (see top of file) — otherwise this program only does generic TCP/ICMP/fragment protection and passes all UDP straight through."
+#endif
+
+// Subnet-level (not just per-IP) new-connection rate limiting — catches a
+// botnet spread across many IPs in one block, each individually under the
+// per-IP cap in rl_state but adding up to a flood in aggregate. Always on
+// (it's a direct extension of the SYN-flood protection below, not a
+// separate opt-in feature area). Tune via -D if the defaults don't fit.
+#ifndef SUBNET_MASK_BITS
+#define SUBNET_MASK_BITS 20 // group source IPs into /20 subnets by default
+#endif
+#ifndef SUBNET_SYN_LIMIT
+#define SUBNET_SYN_LIMIT 500 // new-connection SYNs/sec allowed from one whole subnet
 #endif
 
 #ifdef GAME_TALERUNNER
@@ -145,6 +161,24 @@ struct {
   __uint(max_entries, 2000000);
 }
 rl_state SEC(".maps");
+
+// Subnet-level new-connection rate state (see SUBNET_MASK_BITS above). Just
+// a rolling window/count, deliberately no blackhole_until like ip_state —
+// a whole /20 can be shared by thousands of real users behind CGNAT, so
+// this only throttles the current window rather than escalating to a
+// lasting block the way a single misbehaving IP does.
+struct subnet_state {
+  __u64 window_start;
+  __u32 pkt_count;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, __u32);
+  __type(value, struct subnet_state);
+  __uint(max_entries, 200000);
+}
+subnet_syn_state SEC(".maps");
 
 // LPM (longest-prefix-match) key for the runtime allow/block lists below.
 // prefixlen MUST be the first field (BPF_MAP_TYPE_LPM_TRIE requirement).
@@ -225,7 +259,11 @@ defense_mode SEC(".maps");
 #define ST_RATELIMIT_DROP 20 // adaptive per-IP pps limit exceeded
 #define ST_RUNTIME_ALLOW 21 // matched runtime_allow (IP/CIDR/ASN/country)
 #define ST_RUNTIME_BLOCK 22 // matched runtime_block (IP/CIDR/ASN/country)
-#define ST_COUNT 23
+#define ST_BADSYN_LEN_DROP 23 // SYN packet size doesn't match any real OS's handshake shape
+#define ST_SUBNET_DROP 24 // subnet-level (not just per-IP) new-connection rate exceeded
+#define ST_BADPAYLOAD_DROP 25 // known-bad UDP payload signature (flood-tool fingerprints)
+#define ST_MALFORMED_DROP 26 // protocol header claims an impossible size (e.g. UDP len < 8)
+#define ST_COUNT 27
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -374,6 +412,27 @@ static inline int is_ascii_garbage_flood(void * data, void * data_end) {
     if (p[i] < 0x21 || p[i] > 0x7e) return 0;
   }
   return 1;
+}
+
+// A handful of known-bad UDP payload signatures, decoded from validated
+// production u32 rules — origin of some of these is unclear (opaque
+// flood-tool fingerprints), but they're specific enough that a false
+// positive on unrelated legit traffic isn't realistic. Applied globally,
+// same as the chargen check above. One additional signature from the same
+// source ("getstatus"-shaped, checked against UDP-header-region bytes
+// rather than payload bytes) was NOT ported — its offset math didn't match
+// the pattern of every other rule in that config closely enough to be
+// confident the decode is right, and a wrong signature here is worse than
+// no signature.
+static inline int is_known_bad_udp_payload(void * data, void * data_end) {
+  if (data + 5 <= data_end && bpf_strncmp(data, 5, "flood") == 0)
+    return 1; // literal ASCII filler text from a crude flood tool
+  if (data + 4 <= data_end && * (__u32 * ) data == 0x34663866) // "f8f4", little-endian read
+    return 1; // opaque booter-tool signature
+  if (data + 8 <= data_end && * (__u32 * ) data == 0x646e61d6 &&
+    * (__u32 * )(data + 4) == 0x78252928)
+    return 1; // opaque botnet payload fragment
+  return 0;
 }
 
 #ifdef ENABLE_AMP_PROTECTION
@@ -529,6 +588,70 @@ static inline __u32 syn_weight(struct iphdr * ip, struct tcphdr * tcp) {
   if (ip -> ttl <= 64) return 4; // Linux/BSD/macOS-shaped — less common for players
   if (ip -> ttl <= 128) return 1; // Windows-shaped — generous, matches typical player base
   return 4; // rare bucket (router/embedded/Solaris-shaped) — stricter
+}
+
+// A real OS's SYN is never exactly 40 bytes of IP-total-length (that's a
+// bare 20-byte IP + 20-byte TCP header with zero options — every real stack
+// sends at least MSS) and never much over ~64 bytes either (that's already
+// a generous allowance for MSS+SACK+timestamp+window-scale+NOP padding).
+// Anything outside that shape is a flood tool's crafted packet, not a real
+// handshake attempt. Checked before touching any map.
+static inline int bad_syn_length(struct iphdr * ip) {
+  __u16 total_len = bpf_ntohs(ip -> tot_len);
+  return total_len == 40 || total_len > 64;
+}
+
+// Masks a wire-order IPv4 address (see IPV4() above) down to its top
+// SUBNET_MASK_BITS bits, for grouping source IPs into subnets. Done
+// byte-by-byte on purpose: the raw integer's byte order is reversed from
+// address order (see IPV4()'s comment), so a plain host-order CIDR mask
+// would silently mask the wrong bits.
+static inline __u32 mask_subnet(__u32 addr) {
+  __u8 b[4] = {
+    (__u8)(addr & 0xff),
+    (__u8)((addr >> 8) & 0xff),
+    (__u8)((addr >> 16) & 0xff),
+    (__u8)((addr >> 24) & 0xff)
+  };
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int byte_bits = SUBNET_MASK_BITS - i * 8;
+    if (byte_bits <= 0) b[i] = 0;
+    else if (byte_bits < 8) b[i] &= (__u8)(0xff << (8 - byte_bits));
+  }
+  return (__u32) b[0] | ((__u32) b[1] << 8) | ((__u32) b[2] << 16) | ((__u32) b[3] << 24);
+}
+
+// Subnet-level (not just per-IP) new-connection rate check — catches a
+// botnet spread across many IPs in the same block, each individually under
+// rl_state's per-IP cap but adding up to a flood in aggregate. Rolling
+// window only, no escalating blackhole (see subnet_syn_state's comment).
+static inline int subnet_syn_flood(__u32 src_ip, __u64 now) {
+  __u32 subnet = mask_subnet(src_ip);
+  struct subnet_state * st = bpf_map_lookup_elem( & subnet_syn_state, & subnet);
+  if (st) {
+    if (now - st -> window_start > RL_WINDOW_NS) {
+      st -> window_start = now;
+      st -> pkt_count = 1;
+      return 0;
+    }
+    st -> pkt_count++;
+    return st -> pkt_count > SUBNET_SYN_LIMIT;
+  }
+  struct subnet_state new_st = {
+    .window_start = now,
+    .pkt_count = 1
+  };
+  bpf_map_update_elem( & subnet_syn_state, & subnet, & new_st, BPF_ANY);
+  return 0;
+}
+
+// ICMP echo-request (ping) is common, expected traffic (monitoring, path
+// checks); other ICMP types arriving unsolicited are rarer and more often
+// signal abuse (e.g. spoofed error floods) — same weighted-budget idea as
+// syn_weight(), just for ICMP.
+static inline __u32 icmp_weight(struct icmphdr * icmp) {
+  return icmp -> type == ICMP_ECHO ? 1 : 4;
 }
 
 // Provera da li je payload "legit" za određeni protokol (prvih par bajtova)
@@ -738,10 +861,27 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       struct udphdr * udp = (void * )(ip + 1);
       if ((void * )(udp + 1) > data_end) return XDP_ACCEPT;
 
+      // A UDP packet whose own length field claims less than the 8-byte
+      // header it's part of is never valid — a malformed/crafted packet,
+      // not real traffic. Checked before anything else, no map access.
+      if (bpf_ntohs(udp -> len) < sizeof( * udp)) {
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_MALFORMED_DROP);
+        return XDP_DROP;
+      }
+
       if (is_ascii_garbage_flood((void * )(udp + 1), data_end)) {
         bump_stat(ST_DROP);
         bump_stat(ST_UDP_DROP);
         bump_stat(ST_GARBAGE_DROP);
+        return XDP_DROP;
+      }
+
+      if (is_known_bad_udp_payload((void * )(udp + 1), data_end)) {
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_BADPAYLOAD_DROP);
         return XDP_DROP;
       }
 
@@ -756,7 +896,25 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 
       __u16 dport = bpf_ntohs(udp -> dest);
 
-      if (!is_legit_port(dport)) return XDP_ACCEPT; // nije naš port → kernel
+      if (!is_legit_port(dport)) {
+        // Not one of this box's declared services — still worth a baseline
+        // per-IP rate limit rather than an unconditional pass, so a flood
+        // aimed at a port this box doesn't use doesn't get a completely
+        // free ride. Shares the same per-IP budget as everything else (one
+        // abusive source, one shared cap) — no new map, and no cost at all
+        // for a source that stays under it.
+        __u32 src_ip = ip -> saddr;
+        __u64 ts = bpf_ktime_get_ns();
+        if (rate_limited(src_ip, ts, 1)) {
+          bump_stat(ST_DROP);
+          bump_stat(ST_UDP_DROP);
+          bump_stat(ST_RATELIMIT_DROP);
+          return XDP_DROP;
+        }
+        bump_stat(ST_PASS);
+        bump_stat(ST_UDP_PASS);
+        return XDP_ACCEPT; // nije naš port → kernel
+      }
 
       // Reflected/amplified UDP (memcached, NTP monlist, chargen, SSDP, ...)
       // always arrives from a privileged source port. Real game/voice/VPN
@@ -894,8 +1052,28 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       // SYN admissions, never the bulk established-connection volume.
       if (tcp -> syn && !tcp -> ack) {
         bump_stat(ST_TCP_SYN);
+
+        // Cheapest check first, no map access: does this even look like a
+        // real OS's SYN packet by size?
+        if (bad_syn_length(ip)) {
+          bump_stat(ST_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_BADSYN_LEN_DROP);
+          return XDP_DROP;
+        }
+
         __u32 src_ip = ip -> saddr;
         __u64 ts = bpf_ktime_get_ns();
+
+        // Subnet-level check before the per-IP one — catches a botnet
+        // spread across one block before spending a per-IP map write on it.
+        if (subnet_syn_flood(src_ip, ts)) {
+          bump_stat(ST_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_SUBNET_DROP);
+          return XDP_DROP;
+        }
+
         if (rate_limited(src_ip, ts, syn_weight(ip, tcp))) {
           bump_stat(ST_DROP);
           bump_stat(ST_TCP_DROP);
@@ -907,12 +1085,18 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       }
     }
 
-    // ICMP flood protection (echo floods, smurf-style abuse). Shares the same
-    // per-IP budget as TCP/UDP — one abusive source, one shared cap.
+    // ICMP flood protection (echo floods, smurf-style abuse). Shares the
+    // same per-IP budget as TCP/UDP — one abusive source, one shared cap.
+    // Echo requests (common, expected) cost less of that budget than other
+    // ICMP types (rarer, more often abuse) — see icmp_weight().
     if (ip -> protocol == IPPROTO_ICMP) {
+      struct icmphdr * icmp = (void * )(ip + 1);
+      __u32 weight = 1;
+      if ((void * )(icmp + 1) <= data_end) weight = icmp_weight(icmp);
+
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();
-      if (rate_limited(src_ip, ts, 1)) {
+      if (rate_limited(src_ip, ts, weight)) {
         bump_stat(ST_DROP);
         bump_stat(ST_ICMP_DROP);
         bump_stat(ST_RATELIMIT_DROP);
@@ -946,14 +1130,32 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
     }
 #endif
 
+#ifdef ENABLE_IPIP
+    // Same idea as ENABLE_GRE, for IP-in-IP tunnels (protocol 4).
+    if (ip -> protocol == IPPROTO_IPIP) {
+      int ipip_trusted = 1;
+#ifdef IPIP_ALLOWED_SRC
+      ipip_trusted = ipip_trusted && (ip -> saddr == IPIP_ALLOWED_SRC);
+#endif
+#ifdef IPIP_ALLOWED_DST
+      ipip_trusted = ipip_trusted && (ip -> daddr == IPIP_ALLOWED_DST);
+#endif
+      if (ipip_trusted) {
+        bump_stat(ST_PASS);
+        bump_stat(ST_OTHER_PASS);
+        return XDP_ACCEPT;
+      }
+    }
+#endif
+
     // Any other IP protocol — GRE (47) if ENABLE_GRE isn't set (or set but
-    // not matching GRE_ALLOWED_SRC/DST), ESP (50), AH (51), SUN-ND (77),
-    // IGMP, OSPF, or an outright bogus protocol number. None of this is
-    // expected in any real volume on a game/voice server. Rate-limited
-    // (same shared per-IP budget) rather than hard-blocked, so it doesn't
-    // break other legitimate low-volume,
-    // non-GRE protocol use while still capping a raw-protocol flood — this
-    // was previously a silent, unlimited pass.
+    // not matching GRE_ALLOWED_SRC/DST), IPIP (4) similarly, ESP (50),
+    // AH (51), SUN-ND (77), IGMP, OSPF, or an outright bogus protocol
+    // number. None of this is expected in any real volume on a game/voice
+    // server. Rate-limited (same shared per-IP budget) rather than
+    // hard-blocked, so it doesn't break other legitimate low-volume
+    // protocol use while still capping a raw-protocol flood — this was
+    // previously a silent, unlimited pass.
     if (ip -> protocol != IPPROTO_UDP && ip -> protocol != IPPROTO_TCP && ip -> protocol != IPPROTO_ICMP) {
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();

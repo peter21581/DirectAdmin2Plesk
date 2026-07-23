@@ -91,6 +91,7 @@ source untouched and makes the build reproducible):
 | `ENABLE_OPENVPN` | OpenVPN (UDP 1194) |
 | `ENABLE_WIREGUARD` | WireGuard (UDP 51820) |
 | `ENABLE_GRE` | This box terminates a GRE tunnel (e.g. PPTP) — exempts GRE from the other-protocol rate limiter below, scoped to the real tunnel peer via `GRE_ALLOWED_SRC`/`GRE_ALLOWED_DST` (see below). Leave undefined to have GRE rate-limited like any other non-UDP/TCP/ICMP protocol |
+| `ENABLE_IPIP` | Same idea as `ENABLE_GRE`, for IP-in-IP tunnels (protocol 4) — scoped via `IPIP_ALLOWED_SRC`/`IPIP_ALLOWED_DST` the same way |
 | `ENABLE_AMP_PROTECTION` | UDP reflection/amplification defense — DNS, NTP, memcached, SSDP, chargen, CLDAP, SNMP, portmap |
 
 Anything not defined compiles out completely — no extra branches, no extra
@@ -170,26 +171,50 @@ Re-run the attach command after every rebuild — there's no hot-reload.
   misconfigured network. Applies to every protocol. (`192.88.99.0/24`, the
   6to4 relay anycast block, is deliberately excluded — it's legitimately
   globally routed.)
+- Drops any UDP packet whose own length field claims less than 8 bytes (the
+  size of the UDP header itself) — never valid, always a crafted/malformed
+  packet. Checked before anything else, no map access.
 - Drops UDP packets whose first 24 payload bytes are all printable ASCII —
   the signature shape of chargen reflection floods and generic junk-padded
   UDP floods; no supported protocol here opens with plain text.
+- Drops a handful of other known-bad UDP payload signatures (a literal
+  `"flood"` filler string and two opaque-but-validated flood-tool
+  fingerprints) — same idea as the chargen check, just more specific.
 - Drops invalid TCP flag combinations (null/Xmas/nmap-style scans).
+- Drops SYN packets whose size doesn't match any real OS's handshake shape:
+  exactly 40 bytes (a bare IP+TCP header with zero TCP options — no real
+  stack does that) or over ~64 bytes (already a generous allowance for a
+  full set of options). Checked before any map access.
 - Per-IP adaptive rate limiting with auto-blackholing (30s) once an IP
   exceeds its packet budget for the current defense mode.
 - SYN-flood protection across **all** TCP ports, weighted by a rough
   OS-shape heuristic (Windows-shaped SYNs get a generous budget since real
   players skew Windows; non-Windows or implausible SYNs cost more of the
-  same budget).
-- ICMP flood protection, sharing the same per-IP budget.
+  same budget), **plus** a subnet-level check (default /20) that catches a
+  botnet spread across many IPs in one block, each individually under the
+  per-IP cap but adding up to a flood in aggregate. The subnet check only
+  throttles the current window — it never escalates to a lasting block the
+  way the per-IP one does, since a /20 can be thousands of real users behind
+  CGNAT. Tune with `-DSUBNET_MASK_BITS=N -DSUBNET_SYN_LIMIT=N`.
+- ICMP flood protection, sharing the same per-IP budget, with echo requests
+  (common, expected — monitoring/path checks) costing less of that budget
+  than other ICMP types (rarer, more often abuse).
 - Rate limiting (same shared per-IP budget) for **any other IP protocol** —
-  ESP, AH, SUN-ND, IGMP, OSPF, GRE (unless `ENABLE_GRE`, see below), or an
-  outright bogus protocol number. Previously these all fell through to an
-  unconditional, unlimited `XDP_ACCEPT` since only UDP/TCP/ICMP were handled
-  at all.
+  ESP, AH, SUN-ND, IGMP, OSPF, GRE (unless `ENABLE_GRE`), IPIP (unless
+  `ENABLE_IPIP`), or an outright bogus protocol number. Previously these all
+  fell through to an unconditional, unlimited `XDP_ACCEPT` since only
+  UDP/TCP/ICMP were handled at all.
 - Reflected UDP privileged-source-port block: any UDP packet with a source
   port under 1024 (except `sport 53`, to allow real server-to-server DNS)
   gets dropped before any map lookup — a real client's ephemeral source
   port is never privileged.
+- **Baseline per-IP rate limiting for UDP to any port not covered by an
+  enabled `GAME_*`/`ENABLE_*` flag** — shares the same per-IP budget as
+  everything else rather than an unconditional pass-through. Closes a real
+  gap: previously a flood aimed at a port this box doesn't use at all got
+  zero protection. (TCP never had this gap — `is_legit_port()` is only
+  consulted by the UDP path, so TCP traffic already gets bogus-flags/
+  SYN-flood/subnet/length checks regardless of destination port.)
 - For enabled UDP games: a spoof-resistant challenge/response — the first
   packet that looks like a real protocol handshake gets a random cookie
   echoed back; only a source that actually receives and replies with it
@@ -287,7 +312,7 @@ checks, or `monitor.py` for a live dashboard / Prometheus export.
 
 ### The `stats` map directly
 
-`BPF_MAP_TYPE_PERCPU_ARRAY`, 23 entries (constants named `ST_*` at the top
+`BPF_MAP_TYPE_PERCPU_ARRAY`, 27 entries (constants named `ST_*` at the top
 of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 
 | Index | Name | Meaning |
@@ -300,10 +325,14 @@ of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 | 6-7 | `ST_TCP_PASS`/`ST_TCP_DROP` | **new-connection (SYN) admissions only** — see caveat below |
 | 8 | `ST_TCP_SYN` | new TCP connection attempts seen (pass + drop) |
 | 9-10 | `ST_ICMP_PASS`/`ST_ICMP_DROP` | ICMP totals |
-| 11-12 | `ST_OTHER_PASS`/`ST_OTHER_DROP` | GRE/ESP/AH/SUN-ND/IGMP/OSPF/etc. |
+| 11-12 | `ST_OTHER_PASS`/`ST_OTHER_DROP` | GRE/IPIP/ESP/AH/SUN-ND/IGMP/OSPF/etc. |
 | 13-20 | `ST_FRAG_DROP`, `ST_BOGON_DROP`, `ST_GARBAGE_DROP`, `ST_AMP_DROP`, `ST_REFLECT_DROP`, `ST_BADFLAGS_DROP`, `ST_EXPLOIT_DROP`, `ST_RATELIMIT_DROP` | why a packet was dropped, breaking down the aggregate drop count by reason |
 | 21 | `ST_RUNTIME_ALLOW` | matched an `xdpctl.py`-managed allowlist entry (IP/CIDR/ASN/country) |
 | 22 | `ST_RUNTIME_BLOCK` | matched an `xdpctl.py`-managed blocklist entry |
+| 23 | `ST_BADSYN_LEN_DROP` | SYN packet size didn't match any real OS's handshake shape |
+| 24 | `ST_SUBNET_DROP` | subnet-level (not just per-IP) new-connection rate exceeded |
+| 25 | `ST_BADPAYLOAD_DROP` | known-bad UDP payload signature (flood-tool fingerprints) |
+| 26 | `ST_MALFORMED_DROP` | protocol header claims an impossible size (e.g. UDP length field < 8) |
 
 ```bash
 sudo bpftool map dump name stats
@@ -436,3 +465,20 @@ sudo bpftool map update name defense_mode key 0 0 0 0 value 1 0 0 0
   this compile-time approach doesn't fit — that needs a runtime dst-IP →
   profile map instead (deliberately not built, since the actual deployment
   here is one game server per box).
+- One known-bad UDP payload signature from the same source as the three in
+  `is_known_bad_udp_payload()` was deliberately **not** ported: a
+  `"getstatus"`-shaped 41-byte packet whose rule checked bytes inside the
+  UDP *header* region rather than the payload, unlike every other rule in
+  that source config. The offset math didn't add up with enough confidence
+  to trust the decode — a wrong signature is worse than no signature, so it
+  was left out rather than guessed at.
+- A few other things from that same source config were reviewed and
+  deliberately left out: a STUN magic-cookie (`0x2112A442`) block — the
+  source config itself had this commented out (not live), so it's excluded
+  here too, on the same reasoning they presumably had (STUN is legitimately
+  used by lots of real applications, e.g. WebRTC/voice); a rule dropping
+  TS3-handshake-shaped payloads arriving on a SAMP-designated port
+  (cross-protocol-confusion detection — real signal, but niche enough not
+  to be worth the added complexity here); and a SAMP-specific fixed UDP
+  checksum fingerprint, which was too implementation-specific to that
+  game's exact wire format to confidently decode from the rule alone.
