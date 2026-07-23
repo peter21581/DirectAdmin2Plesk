@@ -53,6 +53,7 @@ STAT_NAMES = [
     "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
     "runtime_allow", "runtime_block",  # xdpctl.py-managed IP/CIDR/ASN/country lists
     "badsyn_len_drop", "subnet_drop", "badpayload_drop", "malformed_drop",
+    "leak_drop", "unverified_drop",
 ]
 
 WHITELIST_TTL_S = 180  # must match filter.c's whitelist TTL
@@ -219,7 +220,7 @@ def print_text(snap):
     for name in ("frag_drop", "bogon_drop", "garbage_drop", "amp_drop",
                  "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
                  "runtime_block", "badsyn_len_drop", "subnet_drop", "badpayload_drop",
-                 "malformed_drop"):
+                 "malformed_drop", "leak_drop", "unverified_drop"):
         print(f"    {name:<15} {s[name]}")
     print(f"runtime allowlist hits (xdpctl.py allow/allow-asn/allow-country): {s['runtime_allow']}")
     print(f"currently blackholed IPs: {len(snap['blackholed'])} (of {snap['tracked_ips']} tracked)")
@@ -277,7 +278,7 @@ def run_tui(interval):
             for name in ("frag_drop", "bogon_drop", "garbage_drop", "amp_drop",
                          "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
                          "runtime_block", "badsyn_len_drop", "subnet_drop", "badpayload_drop",
-                 "malformed_drop"):
+                 "malformed_drop", "leak_drop", "unverified_drop"):
                 line(f"  {name:<15} {s[name]:>10}  {r(name):>10}")
             line(f"runtime allowlist hits: {s['runtime_allow']:>10}  {r('runtime_allow'):>10}"
                  f"   (xdpctl.py allow/allow-asn/allow-country)")

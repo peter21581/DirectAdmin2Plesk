@@ -71,9 +71,9 @@ source untouched and makes the build reproducible):
 | Flag | Covers |
 |---|---|
 | `GAME_RUST` | Rust (RakNet, UDP 28015) |
-| `GAME_FIVEM` | FiveM / RedM (UDP+TCP 30000-32000) |
-| `GAME_MINECRAFT` | Bedrock (UDP 19132) + Java/GS4 query (UDP 25565-25575) |
-| `GAME_TS3` | TeamSpeak 3 (UDP 9000-10500) |
+| `GAME_FIVEM` | FiveM / RedM (UDP+TCP 30000-32000). Also blocks the `/players.json` HTTP endpoint on established TCP connections in that range — a known FiveM privacy leak that exposes every connected player's real IP address, unrelated to DDoS |
+| `GAME_MINECRAFT` | Bedrock (UDP 19132) + Java/GS4 query (UDP 25565-25575) + an extra UDP/TCP backend range (19000-20000, e.g. BungeeCord/Velocity proxy backends) |
+| `GAME_TS3` | TeamSpeak 3 (UDP 9000-10500). Also gates the TCP file-transfer port (30033, avatars/icons/channel files): a SYN there is rejected unless the source already passed the UDP voice challenge (same `whitelist` trust window) — a real client never opens it first |
 | `GAME_ARK` | ARK: Survival Evolved (high/dynamic query ports) |
 | `GAME_SAMP` | San Andreas Multiplayer (UDP 7777) |
 | `GAME_SQUAD` | Squad (UDP 7787, 21114, 27165, 7000-8999) |
@@ -312,7 +312,7 @@ checks, or `monitor.py` for a live dashboard / Prometheus export.
 
 ### The `stats` map directly
 
-`BPF_MAP_TYPE_PERCPU_ARRAY`, 27 entries (constants named `ST_*` at the top
+`BPF_MAP_TYPE_PERCPU_ARRAY`, 29 entries (constants named `ST_*` at the top
 of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 
 | Index | Name | Meaning |
@@ -333,6 +333,8 @@ of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 | 24 | `ST_SUBNET_DROP` | subnet-level (not just per-IP) new-connection rate exceeded |
 | 25 | `ST_BADPAYLOAD_DROP` | known-bad UDP payload signature (flood-tool fingerprints) |
 | 26 | `ST_MALFORMED_DROP` | protocol header claims an impossible size (e.g. UDP length field < 8) |
+| 27 | `ST_LEAK_DROP` | blocked a data-leak-prone request (FiveM `/players.json`) |
+| 28 | `ST_UNVERIFIED_DROP` | rejected: source hasn't passed a required prior verification step (TS3 file-transfer port) |
 
 ```bash
 sudo bpftool map dump name stats
@@ -482,3 +484,27 @@ sudo bpftool map update name defense_mode key 0 0 0 0 value 1 0 0 0
   to be worth the added complexity here); and a SAMP-specific fixed UDP
   checksum fingerprint, which was too implementation-specific to that
   game's exact wire format to confidently decode from the rule alone.
+- **Pure ACK-floods (no real handshake ever happened) aren't caught.**
+  `bogus_tcp_flags()` only rejects structurally invalid flag combinations —
+  a plain ACK packet claiming to belong to an established connection looks
+  completely valid to it. The source config's `GXP_TCP_STATELESS` chain
+  catches this class of attack by tracking whether a real SYN → SYN-ACK →
+  ACK handshake was actually observed. That's not portable here: proving a
+  handshake completed requires seeing the box's own **outbound** SYN-ACK,
+  and this program only hooks **ingress** — an XDP program attached this
+  way architecturally cannot see egress traffic. Doing this properly would
+  need a second hook (TC egress) tracking outbound SYN-ACKs, which is a
+  real architecture change, not something to bolt on quietly.
+- The source config's `GXP_TCPTHENUDP` pattern (require a successful TCP
+  handshake from an IP before trusting its UDP traffic — spoof-resistant
+  because completing a TCP handshake proves the source can actually receive
+  traffic) was reviewed and not implemented as a general mechanism. None of
+  the currently-supported games need it specifically, and the UDP
+  challenge/response system already in this file achieves a comparable
+  guarantee for the games that do need spoof resistance.
+- Minecraft's extra backend range intentionally covers 19000-20000 but
+  **not** the 49152-65535 range also present in the source config for
+  "custom" Minecraft deployments — that's most of the OS ephemeral port
+  range, and allowing it wholesale would make the port scoping close to
+  meaningless. If you specifically need it, add it under `GAME_MINECRAFT`
+  in `is_legit_port()`.

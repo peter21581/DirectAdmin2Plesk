@@ -123,6 +123,7 @@
 
 #define RL_WINDOW_NS 1000000000ULL // 1s per-IP rate window
 #define BLACKHOLE_NS 30000000000ULL // 30s auto-blackhole once an IP exceeds its limit
+#define WHITELIST_TTL_NS 180000000000ULL // 180s trust window after passing the UDP challenge
 
 struct challenge {
   __u64 timestamp;
@@ -263,7 +264,9 @@ defense_mode SEC(".maps");
 #define ST_SUBNET_DROP 24 // subnet-level (not just per-IP) new-connection rate exceeded
 #define ST_BADPAYLOAD_DROP 25 // known-bad UDP payload signature (flood-tool fingerprints)
 #define ST_MALFORMED_DROP 26 // protocol header claims an impossible size (e.g. UDP len < 8)
-#define ST_COUNT 27
+#define ST_LEAK_DROP 27 // blocked a data-leak-prone request (e.g. FiveM /players.json)
+#define ST_UNVERIFIED_DROP 28 // rejected: source hasn't passed a required prior verification step
+#define ST_COUNT 29
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -327,6 +330,7 @@ static inline int is_legit_port(__u16 dport) {
 #ifdef GAME_MINECRAFT
   if (dport == 19132) return 1; // Bedrock
   if (dport >= 25565 && dport <= 25575) return 1; // Java (+ GS4 query)
+  if (dport >= 19000 && dport <= 20000) return 1; // extra backend range (e.g. BungeeCord/Velocity)
 #endif
 #ifdef GAME_ARK
   if (dport >= 19132 && dport <= 65535) return 1; // ARK query ports are high/dynamic
@@ -521,6 +525,26 @@ static inline int is_known_bad_tcp_payload(void * data, void * data_end) {
   __u16 mid = (p[4] << 8) | p[5];
   return mid == 0x2009 || mid == 0x330e || mid == 0x1809 ||
     mid == 0x4906 || mid == 0x1f09 || mid == 0x2006;
+}
+#endif
+
+#ifdef GAME_FIVEM
+// FiveM exposes a /players.json HTTP endpoint by default that leaks every
+// connected player's real IP address — a known privacy/IP-grabbing vector
+// in that community, not a DDoS concern. Scoped strictly to FiveM's TCP
+// port range and to established connections carrying a payload (an HTTP
+// request never arrives on the SYN itself, so this never touches the hot
+// SYN path). Single-packet substring scan only — like iptables' own
+// non-conntrack -m string, this can miss a request whose path happens to
+// straddle a TCP segment boundary.
+static inline int is_players_json_request(void * data, void * data_end) {
+  #pragma unroll
+  for (int i = 0; i < 128; i++) {
+    if (data + i + 13 > data_end) break;
+    if (bpf_strncmp((char * ) data + i, 13, "/players.json") == 0)
+      return 1;
+  }
+  return 0;
 }
 #endif
 
@@ -942,7 +966,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 
       // Check the whitelist
       __u64 * wl_ts = bpf_map_lookup_elem( & whitelist, & src_ip);
-      if (wl_ts && ts - * wl_ts < 180000000000ULL) { // 180-second whitelist
+      if (wl_ts && ts - * wl_ts < WHITELIST_TTL_NS) {
         bump_stat(ST_PASS);
         bump_stat(ST_UDP_PASS);
         return XDP_ACCEPT;
@@ -1042,6 +1066,42 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         bump_stat(ST_TCP_DROP);
         bump_stat(ST_EXPLOIT_DROP);
         return XDP_DROP;
+      }
+#endif
+
+#ifdef GAME_FIVEM
+      // Only established connections on FiveM's TCP port range can carry
+      // an HTTP request at all — skip entirely for SYN/SYN+ACK, and for
+      // any other TCP port on this box.
+      __u16 fivem_dport = bpf_ntohs(tcp -> dest);
+      if (!tcp -> syn && fivem_dport >= 30000 && fivem_dport <= 32000) {
+        void * http_payload = (void * ) tcp + (tcp -> doff * 4); // account for TCP options
+        if (is_players_json_request(http_payload, data_end)) {
+          bump_stat(ST_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_LEAK_DROP);
+          return XDP_DROP;
+        }
+      }
+#endif
+
+#ifdef GAME_TS3
+      // TeamSpeak 3's file-transfer port (avatars/icons/channel files) — a
+      // real client only ever opens this after already completing the UDP
+      // voice handshake (see whitelist/is_known_public_dns's sibling map
+      // above). Reject the TCP handshake outright from a source that
+      // hasn't recently passed that UDP challenge; there's no legitimate
+      // reason to hit this port first.
+      if (tcp -> syn && !tcp -> ack && bpf_ntohs(tcp -> dest) == 30033) {
+        __u32 ts3_src = ip -> saddr;
+        __u64 * ts3_wl = bpf_map_lookup_elem( & whitelist, & ts3_src);
+        __u64 ts3_now = bpf_ktime_get_ns();
+        if (!ts3_wl || ts3_now - * ts3_wl >= WHITELIST_TTL_NS) {
+          bump_stat(ST_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_UNVERIFIED_DROP);
+          return XDP_DROP;
+        }
       }
 #endif
 
