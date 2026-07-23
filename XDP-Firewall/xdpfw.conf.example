@@ -1,0 +1,26 @@
+verbose = 2;
+log_file = "/var/log/xdpfw.log";
+interface = "ens18";
+update_time = 15;
+no_stats = false;
+stats_per_second = false;
+stdout_update_time = 1000;
+
+filters = (
+    {
+        enabled = true,
+        action = 1
+    },
+
+    // Example: only let UDP 28015 through if the payload actually looks
+    // like a real Rust/RakNet packet, not just a flood aimed at the port.
+    // See README.md's "game" filter option -- other supported values are
+    // fivem, source_engine, minecraft_be, samp, ts3.
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     udp_enabled = true,
+    //     udp_dport = 28015,
+    //     game = "rust"
+    // }
+);

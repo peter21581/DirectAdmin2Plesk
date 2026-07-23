@@ -1,94 +1,111 @@
-#!/usr/bin/env bash
-# install.sh — dependency installer for filter.c (XDP anti-DDoS firewall)
-# on Debian/Ubuntu and AlmaLinux/RHEL/Rocky.
-#
-# Installs: clang/LLVM (BPF target codegen), libbpf headers, bpftool,
-# matching kernel headers, iproute2 (for `ip link ... xdp`), python3
-# (monitor.py / xdpctl.py), and curl (xdpctl.py's ASN/country lookups).
-#
-# This only installs build/runtime dependencies. It does not build or
-# attach filter.c itself — see FILTER.md for that.
-#
-# CAVEAT: written and reviewed for correctness, but not run end-to-end on a
-# real Debian or AlmaLinux box (no such environment was available while
-# writing this). Read through it before running with root privileges on a
-# production box, same as you should for any installer script.
+#!/bin/bash
+LIBXDP=0
+INSTALL=1
+CLEAN=0
+OBJDUMP=0
+HELP=0
+STATIC=1
 
-set -euo pipefail
+while [[ $# -gt 0 ]]; do
+    key="$1"
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Run as root (sudo $0)." >&2
-  exit 1
-fi
+    case $key in
+        --libxdp)
+            LIBXDP=1
 
-if [ ! -r /etc/os-release ]; then
-  echo "Cannot detect distro: /etc/os-release not found." >&2
-  exit 1
-fi
-. /etc/os-release
+            shift
+            ;;
 
-KREL="$(uname -r)"
+        --no-install)
+            INSTALL=0
 
-case "${ID}:${ID_LIKE:-}" in
-  debian:* | ubuntu:* | *:*debian* )
-    echo "Detected Debian-family distro (${PRETTY_NAME:-$ID})."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y \
-      clang llvm \
-      libbpf-dev \
-      bpftool \
-      "linux-headers-${KREL}" \
-      iproute2 \
-      python3 \
-      curl
-    # bpftool sometimes ships as linux-tools-<kernel> instead of a standalone
-    # package, depending on the Debian/Ubuntu release — fall back if the
-    # plain 'bpftool' package doesn't exist.
-    if ! command -v bpftool >/dev/null 2>&1; then
-      echo "bpftool not on PATH after install — trying linux-tools packages..."
-      apt-get install -y "linux-tools-${KREL}" linux-tools-common || \
-        apt-get install -y linux-tools-generic || true
-    fi
-    ;;
+            shift
+            ;;
 
-  almalinux:* | rocky:* | rhel:* | centos:* | *:*rhel* | *:*fedora* )
-    echo "Detected RHEL-family distro (${PRETTY_NAME:-$ID})."
-    PKG_MGR="dnf"
-    command -v dnf >/dev/null 2>&1 || PKG_MGR="yum"
-    "$PKG_MGR" install -y epel-release || true
-    "$PKG_MGR" install -y \
-      clang llvm \
-      libbpf-devel \
-      bpftool \
-      "kernel-devel-${KREL}" \
-      iproute \
-      python3 \
-      curl
-    if ! command -v bpftool >/dev/null 2>&1; then
-      echo "bpftool not on PATH after install — trying kernel-tools..."
-      "$PKG_MGR" install -y kernel-tools || true
-    fi
-    ;;
+        --clean)
+            CLEAN=1
 
-  * )
-    echo "Unrecognized distro (ID=${ID}, ID_LIKE=${ID_LIKE:-}). This script" >&2
-    echo "only knows Debian/Ubuntu and AlmaLinux/RHEL/Rocky/CentOS. Install" >&2
-    echo "clang, llvm, libbpf headers, bpftool, matching kernel headers," >&2
-    echo "iproute2, python3, and curl manually." >&2
-    exit 1
-    ;;
-esac
+            shift
+            ;;
 
-echo
-echo "Checking what actually landed:"
-for bin in clang bpftool ip python3 curl; do
-  if command -v "$bin" >/dev/null 2>&1; then
-    printf '  %-10s OK  (%s)\n' "$bin" "$(command -v "$bin")"
-  else
-    printf '  %-10s MISSING — install it manually before building/running filter.c\n' "$bin"
-  fi
+        --no-static)
+            STATIC=0
+            
+            shift
+            ;;
+
+        --objdump)
+            OBJDUMP=1
+
+            shift
+            ;;
+
+        --help)
+            HELP=1
+
+            shift
+            ;;
+        *)
+
+            shift
+            ;;
+        esac
 done
 
-echo
-echo "Done. Next: see FILTER.md to build and attach filter.c."
+if [ "$HELP" -gt 0 ]; then
+    echo "Usage: install.sh [OPTIONS]"
+    echo
+    echo "Options:"
+    echo "  --libxdp       Build and install LibXDP before building the tool."
+    echo "  --no-install   Build the tool and/or LibXDP without installing them."
+    echo "  --clean        Remove build files for the tool and LibXDP."
+    echo "  --no-static    Do not statically link LibXDP and LibBPF object files when building the tool and rely on shared libraries (-lbpf and -lxdp flags)."
+    echo "  --objdump      Dumps the XDP/BPF object file using 'llvm-objdump' to Assemby into 'objdump.asm'."
+    echo "  --help         Display this help message."
+
+    exit 0
+fi
+
+if [ "$CLEAN" -gt 0 ]; then
+    if [ "$LIBXDP" -gt 0 ]; then
+        echo "Cleaning LibXDP..."
+
+        ./scripts/libxdp_clean.sh
+    fi
+
+    echo "Cleaning up tool..."
+
+    ./scripts/clean.sh
+
+    exit 0
+fi
+
+if [ "$OBJDUMP" -gt 0 ]; then
+    echo "Dumping object file..."
+
+    ./scripts/objdump.sh
+
+    exit 0
+fi
+
+if [ "$LIBXDP" -gt 0 ]; then
+    echo "Building LibXDP..."
+
+    ./scripts/libxdp_build.sh
+
+    if [ "$INSTALL" -gt 0 ]; then
+        echo "Installing LibXDP..."
+
+        sudo ./scripts/libxdp_install.sh
+    fi
+fi
+
+echo "Building tool..."
+
+./scripts/build.sh $STATIC
+
+if [ "$INSTALL" -gt 0 ]; then
+    echo "Installing tool..."
+
+    sudo ./scripts/install.sh
+fi

@@ -1,0 +1,6 @@
+.vscode/
+xdpfw
+*.s
+*.conf
+*.log
+*.asm

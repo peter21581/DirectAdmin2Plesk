@@ -1,0 +1,42 @@
+#pragma once
+
+#include <common/all.h>
+
+#include <string.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <string.h>
+#include <strings.h>
+#include <ctype.h>
+
+#include <sys/sysinfo.h>
+
+struct ip_range
+{
+    u32 ip;
+    u8 cidr;
+} typedef ip_range_t;
+
+struct port_range
+{
+    unsigned int success;
+    u16 min;
+    u16 max;
+} typedef port_range_t;
+
+extern int cont;
+
+void print_help_menu();
+void hdl_signal(int code);
+ip_range_t parse_ip_range(const char* ip);
+const char* get_protocol_str_by_id(int id);
+void print_tool_info();
+u64 get_boot_nano_time();
+port_range_t parse_port_range(const char* range_str);
+
+// Maps a `game` config string (e.g. "rust") to its game_id_t (see
+// common/games.h) and back, for the `game` filter option.
+int game_id_from_name(const char* name);
+const char* game_name_from_id(int id);
