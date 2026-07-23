@@ -37,6 +37,7 @@ Scope, on purpose:
     signal to show for them.
 """
 import argparse
+import ipaddress
 import json
 import struct
 import subprocess
@@ -54,6 +55,7 @@ STAT_NAMES = [
     "runtime_allow", "runtime_block",  # xdpctl.py-managed IP/CIDR/ASN/country lists
     "badsyn_len_drop", "subnet_drop", "badpayload_drop", "malformed_drop",
     "leak_drop", "unverified_drop",
+    "ipv6_pass", "ipv6_drop",  # 29-30: family-level only — protocol/reason breakdown above is shared across v4/v6
 ]
 
 WHITELIST_TTL_S = 180  # must match filter.c's whitelist TTL
@@ -109,8 +111,9 @@ def dump_map(name):
     return run_bpftool("map", "dump", "id", str(find_map_id(name)))
 
 
-def fmt_ip(raw4):
-    return ".".join(str(b) for b in raw4)
+def fmt_ip(raw):
+    """4 raw bytes -> IPv4, 16 raw bytes -> IPv6."""
+    return str(ipaddress.ip_address(bytes(raw)))
 
 
 def boot_epoch():
@@ -150,39 +153,51 @@ def read_defense_mode():
 
 
 def read_rl_state(now_ns):
-    """rl_state: key=u32 src IP, value=struct ip_state {
-      u64 window_start; u32 pkt_count; u64 blackhole_until; } — 24 bytes,
-    with 4 bytes of compiler padding after pkt_count so blackhole_until
-    lands on an 8-byte boundary. Format string: <QIxxxxQ (8+4+4pad+8=24)."""
+    """rl_state / rl_state_v6: key=src IP (4 or 16 raw bytes), value=struct
+    ip_state { u64 window_start; u32 pkt_count; u64 blackhole_until; } — 24
+    bytes, with 4 bytes of compiler padding after pkt_count so
+    blackhole_until lands on an 8-byte boundary. Format: <QIxxxxQ
+    (8+4+4pad+8=24), same layout for both families."""
     out = []
-    for entry in dump_map("rl_state"):
-        key = to_bytes(entry["key"])
-        val = to_bytes(entry["value"])
-        if len(key) < 4 or len(val) < 24:
-            continue
-        _window_start, pkt_count, blackhole_until = struct.unpack_from("<QIxxxxQ", val)
-        out.append({
-            "ip": fmt_ip(key[:4]),
-            "pkt_count": pkt_count,
-            "blackholed": bool(blackhole_until) and blackhole_until > now_ns,
-            "blackhole_remaining_s": max(0.0, (blackhole_until - now_ns) / 1e9) if blackhole_until else 0.0,
-        })
+    for map_name in ("rl_state", "rl_state_v6"):
+        try:
+            entries = dump_map(map_name)
+        except RuntimeError:
+            continue  # map not present in this build
+        for entry in entries:
+            key = to_bytes(entry["key"])
+            val = to_bytes(entry["value"])
+            if len(key) < 4 or len(val) < 24:
+                continue
+            _window_start, pkt_count, blackhole_until = struct.unpack_from("<QIxxxxQ", val)
+            out.append({
+                "ip": fmt_ip(key),
+                "pkt_count": pkt_count,
+                "blackholed": bool(blackhole_until) and blackhole_until > now_ns,
+                "blackhole_remaining_s": max(0.0, (blackhole_until - now_ns) / 1e9) if blackhole_until else 0.0,
+            })
     return out
 
 
 def read_whitelist(epoch):
-    """whitelist: key=u32 src IP, value=u64 timestamp (ns since boot) of the
-    last passed UDP challenge. filter.c only trusts entries under 180s old;
-    older ones are stale leftovers still sitting in the LRU map."""
+    """whitelist / whitelist_v6: key=src IP (4 or 16 raw bytes), value=u64
+    timestamp (ns since boot) of the last passed UDP challenge. filter.c
+    only trusts entries under 180s old; older ones are stale leftovers
+    still sitting in the LRU map."""
     out = []
-    for entry in dump_map("whitelist"):
-        key = to_bytes(entry["key"])
-        val = to_bytes(entry["value"])
-        if len(key) < 4 or len(val) < 8:
+    for map_name in ("whitelist", "whitelist_v6"):
+        try:
+            entries = dump_map(map_name)
+        except RuntimeError:
             continue
-        ts_ns = struct.unpack_from("<Q", val)[0]
-        age_s = time.time() - (epoch + ts_ns / 1e9)
-        out.append({"ip": fmt_ip(key[:4]), "age_s": age_s, "trusted": 0 <= age_s < WHITELIST_TTL_S})
+        for entry in entries:
+            key = to_bytes(entry["key"])
+            val = to_bytes(entry["value"])
+            if len(key) < 4 or len(val) < 8:
+                continue
+            ts_ns = struct.unpack_from("<Q", val)[0]
+            age_s = time.time() - (epoch + ts_ns / 1e9)
+            out.append({"ip": fmt_ip(key), "age_s": age_s, "trusted": 0 <= age_s < WHITELIST_TTL_S})
     return out
 
 
@@ -246,6 +261,8 @@ def print_text(snap):
     print(f"  tcp   pass={s['tcp_pass']:>10} drop={s['tcp_drop']:>10}  syn_seen={s['tcp_syn']}")
     print(f"  icmp  pass={s['icmp_pass']:>10} drop={s['icmp_drop']:>10}")
     print(f"  other pass={s['other_pass']:>10} drop={s['other_drop']:>10}")
+    print(f"  ipv6  pass={s['ipv6_pass']:>10} drop={s['ipv6_drop']:>10}  "
+          f"(family-level only — protocol/reason breakdown above is shared across v4/v6)")
     print("  drop reasons:")
     for name in ("frag_drop", "bogon_drop", "garbage_drop", "amp_drop",
                  "reflect_drop", "badflags_drop", "exploit_drop", "ratelimit_drop",
@@ -306,6 +323,8 @@ def run_tui(interval):
                  f"   (syn_seen={s['tcp_syn']}, established traffic not counted — see --help)")
             line(f"{'icmp':10}{s['icmp_pass']:>12}{s['icmp_drop']:>12}{r('icmp_drop'):>14}")
             line(f"{'other':10}{s['other_pass']:>12}{s['other_drop']:>12}{r('other_drop'):>14}")
+            line(f"{'ipv6':10}{s['ipv6_pass']:>12}{s['ipv6_drop']:>12}{r('ipv6_drop'):>14}"
+                 f"   (family-level only, see --help)")
             line(f"challenges sent: {s['challenge']}   new blackhole events: {s['blackhole']}")
             line("")
             line("drop reasons:")

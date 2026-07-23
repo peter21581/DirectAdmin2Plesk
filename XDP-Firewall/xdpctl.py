@@ -3,10 +3,12 @@
 xdpctl.py — runtime allow/block-list manager for filter.c's XDP firewall.
 
 Adds/removes entries in the `runtime_allow` / `runtime_block` LPM-trie maps
-while the XDP program keeps running — no rebuild, no reattach. Accepts a
-single IP (implicit /32), a CIDR block, an ASN (resolved to its currently
-announced prefixes via the RIPEstat public API), or a country code
-(resolved to its aggregate CIDR blocks via ipdeny.com's public zone files).
+(IPv4) or their `_v6` siblings (IPv6 — picked automatically based on the
+address you pass) while the XDP program keeps running — no rebuild, no
+reattach. Accepts a single IP (implicit /32 or /128), a CIDR block, an ASN
+(resolved to its currently announced prefixes via the RIPEstat public API,
+IPv4 only), or a country code (resolved to its aggregate CIDR blocks via
+ipdeny.com's public zone files, IPv4 only).
 
 Run ON the box where filter.c is attached. Requires bpftool and root (or
 CAP_BPF). Resolving an ASN or country additionally requires outbound HTTPS
@@ -19,7 +21,7 @@ since no Linux/eBPF environment was available while writing this. Run with
 landed before trusting it in production.
 
 Usage:
-  xdpctl.py allow   <ip|cidr>       # e.g. 203.0.113.5  or  203.0.113.0/24
+  xdpctl.py allow   <ip|cidr>       # e.g. 203.0.113.5, 203.0.113.0/24, 2001:db8::1, 2001:db8::/32
   xdpctl.py block   <ip|cidr>
   xdpctl.py unallow <ip|cidr>
   xdpctl.py unblock <ip|cidr>
@@ -63,16 +65,21 @@ def run_bpftool(*args, check=True):
 
 
 def key_bytes(network):
-    """Pack a struct ip_key { u32 prefixlen; u32 addr; } exactly the way
+    """Pack a struct ip_key { u32 prefixlen; u32 addr; } (or its v6 sibling
+    struct ip6_key { u32 prefixlen; struct in6_addr addr; }) exactly the way
     filter.c's compiler laid it out: prefixlen first (native/little-endian
-    on any real target here), then the 4 address octets in their literal
-    wire order (matching the IPV4() macro convention in filter.c — NOT
-    byte-swapped)."""
+    on any real target here), then the address octets in their literal wire
+    order (matching the IPV4()/IPV6() macro convention in filter.c — NOT
+    byte-swapped). Works for both families — packed() gives 4 bytes for v4,
+    16 for v6."""
     net = ipaddress.ip_network(network, strict=False)
-    if net.version != 4:
-        raise ValueError("filter.c is IPv4-only — no IPv6 support")
-    addr_bytes = net.network_address.packed  # 4 bytes, in dotted-quad order
-    return struct.pack("<I", net.prefixlen) + addr_bytes
+    return struct.pack("<I", net.prefixlen) + net.network_address.packed
+
+
+def versioned_map_name(base_map_name, network):
+    """runtime_allow/runtime_block for v4, *_v6 sibling for v6."""
+    net = ipaddress.ip_network(network, strict=False)
+    return f"{base_map_name}_v6" if net.version == 6 else base_map_name
 
 
 def hex_arg(b):
@@ -80,7 +87,8 @@ def hex_arg(b):
     return " ".join(f"{byte:02x}" for byte in b)
 
 
-def map_update(map_name, network, tag):
+def map_update(base_map_name, network, tag):
+    map_name = versioned_map_name(base_map_name, network)
     kb = key_bytes(network)
     args = [
         "map", "update", "name", map_name,
@@ -91,7 +99,8 @@ def map_update(map_name, network, tag):
     print(f"{map_name}: added {network} (tag={TAG_NAMES[tag]})")
 
 
-def map_delete(map_name, network):
+def map_delete(base_map_name, network):
+    map_name = versioned_map_name(base_map_name, network)
     kb = key_bytes(network)
     args = ["map", "delete", "name", map_name, "key", "hex", *hex_arg(kb).split()]
     result = run_bpftool(*args, check=False)
@@ -120,7 +129,10 @@ def to_bytes(field):
 
 
 def list_map(map_name):
-    result = run_bpftool("-j", "map", "dump", "name", map_name)
+    result = run_bpftool("-j", "map", "dump", "name", map_name, check=False)
+    if result.returncode != 0:
+        print(f"{map_name}: not found ({result.stderr.strip()})", file=sys.stderr)
+        return
     entries = json.loads(result.stdout)
     rows = []
     for e in entries:
@@ -129,15 +141,19 @@ def list_map(map_name):
         if len(key) < 8:
             continue
         prefixlen = struct.unpack_from("<I", key, 0)[0]
-        addr = key[4:8]
+        addr_bytes = key[4:]
         tag = val[0] if val else 0
-        cidr = f"{'.'.join(str(b) for b in addr)}/{prefixlen}"
+        if len(addr_bytes) >= 16:
+            addr = str(ipaddress.IPv6Address(addr_bytes[:16]))
+        else:
+            addr = str(ipaddress.IPv4Address(addr_bytes[:4]))
+        cidr = f"{addr}/{prefixlen}"
         rows.append((cidr, TAG_NAMES.get(tag, f"tag{tag}")))
     if not rows:
         print(f"{map_name}: empty")
         return
     for cidr, tag in sorted(rows):
-        print(f"  {cidr:<20} {tag}")
+        print(f"  {cidr:<28} {tag}")
 
 
 def fetch_json(url):
@@ -199,7 +215,7 @@ def main():
 
     for name in ("allow", "block", "unallow", "unblock"):
         p = sub.add_parser(name)
-        p.add_argument("target", help="IP address or CIDR, e.g. 203.0.113.5 or 203.0.113.0/24")
+        p.add_argument("target", help="IPv4/IPv6 address or CIDR, e.g. 203.0.113.5, 203.0.113.0/24, or 2001:db8::/32")
 
     for name in ("allow-asn", "block-asn"):
         p = sub.add_parser(name)
@@ -232,8 +248,10 @@ def main():
         cmd_bulk(args, "runtime_block", resolve_country_prefixes(args.country), TAG_COUNTRY)
     elif args.cmd == "list-allow":
         list_map("runtime_allow")
+        list_map("runtime_allow_v6")
     elif args.cmd == "list-block":
         list_map("runtime_block")
+        list_map("runtime_block_v6")
 
 
 if __name__ == "__main__":

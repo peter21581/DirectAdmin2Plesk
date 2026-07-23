@@ -223,6 +223,48 @@ Re-run the attach command after every rebuild — there's no hot-reload.
   gets whitelisted for 180s. This defeats spoofed-source floods that static
   signature matching (e.g. iptables `-m string`) cannot.
 
+## IPv6
+
+Full dual-stack support, always on (no flag) — every protection above
+applies equally to IPv6 traffic via a parallel set of maps/helpers
+(`_v6` suffix in the source), with these differences from the IPv4 path:
+
+- **Bogon filtering** covers `::`/`::1`, `::ffff:0:0/96` (IPv4-mapped),
+  `fe80::/10` (link-local), `fc00::/7` (ULA), `2001:db8::/32` (documentation),
+  and `ff00::/8` (multicast). Deliberately **not** covered: Teredo, 6to4,
+  NAT64, and discard-only ranges — narrower scope than the IPv4 bogon list,
+  reviewed but not chased further.
+- **Extension headers** (Hop-by-Hop, Routing, Destination Options) are
+  walked, bounded to 4 headers deep. A Fragment header is dropped (mirrors
+  the IPv4 fragment policy — no supported protocol fragments legitimately).
+  ESP/AH or an unrecognized/truncated chain is passed through unexamined
+  (opaque payload, nothing to inspect, not worth breaking real IPsec
+  traffic over).
+- Subnet-level SYN throttling uses `SUBNET_MASK_BITS_V6` (default `/64`,
+  the standard single-customer IPv6 delegation size) instead of
+  `SUBNET_MASK_BITS`. Byte-aligned only (must be a multiple of 8).
+- The DNS/NTP amplification-exemption lists (`ENABLE_AMP_PROTECTION`) have
+  IPv6 equivalents for Google, Cloudflare, Quad9, and AdGuard DNS, and
+  Cloudflare NTP. **Google Public NTP's IPv6 addresses are not exempted** —
+  unlike its stable documented IPv4 `/24`, Google doesn't publish stable
+  IPv6 addresses for it (anycast, live-resolved only), so hardcoding
+  something not confidently verifiable was skipped.
+- The UDP challenge/response reply is a genuine IPv6 packet (40-byte
+  header, 16-byte address swap, no IP checksum to compute — IPv6 doesn't
+  have one) with one real extra cost: unlike the IPv4 reply (which can
+  leave the UDP checksum at 0, optional), IPv6 UDP checksums are
+  **mandatory** per RFC 8200, so the reply computes a real pseudo-header
+  checksum (`udp6_checksum()`).
+- **Not extended to IPv6 in this pass**: `ENABLE_HANDSHAKE_VERIFY` (no
+  `tcp_handshake_v6` map — pure ACK-floods over IPv6 aren't caught even
+  with the flag on) and `ENABLE_GRE`/`ENABLE_IPIP` trusted-peer source
+  scoping (IPv6-encapsulated GRE/IPIP just falls into the generic
+  rate-limited "other protocol" bucket, same as anything unrecognized).
+  Both are documented gaps, not oversights — see Known limitations.
+- Runtime allow/block via `xdpctl.py` supports IPv6 CIDRs/addresses too
+  (routed to `runtime_allow_v6`/`runtime_block_v6` automatically based on
+  the address you pass — see Runtime allow/block lists below).
+
 ## `ENABLE_GRE` — GRE tunnel bypass
 
 Off by default, so GRE (protocol 47) gets the same rate-limited treatment as
@@ -401,7 +443,7 @@ checks, or `monitor.py` for a live dashboard / Prometheus export.
 
 ### The `stats` map directly
 
-`BPF_MAP_TYPE_PERCPU_ARRAY`, 29 entries (constants named `ST_*` at the top
+`BPF_MAP_TYPE_PERCPU_ARRAY`, 31 entries (constants named `ST_*` at the top
 of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 
 | Index | Name | Meaning |
@@ -424,6 +466,7 @@ of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 | 26 | `ST_MALFORMED_DROP` | protocol header claims an impossible size (e.g. UDP length field < 8) |
 | 27 | `ST_LEAK_DROP` | blocked a data-leak-prone request (FiveM `/players.json`) |
 | 28 | `ST_UNVERIFIED_DROP` | rejected: source hasn't passed a required prior verification step (TS3 file-transfer port, FiveM's TCP gate, or — with `ENABLE_HANDSHAKE_VERIFY` — any TCP flow with no real tracked handshake) |
+| 29-30 | `ST_IPV6_PASS`/`ST_IPV6_DROP` | aggregate IPv6 pass/drop (family-level only — the protocol/reason breakdown above, rows 4-28, is shared across v4 and v6, not split further) |
 
 ```bash
 sudo bpftool map dump name stats
@@ -479,15 +522,19 @@ adjust if your `bpftool` emits something different.
 
 ## Runtime allow/block lists
 
-`xdpctl.py` adds and removes entries in two `BPF_MAP_TYPE_LPM_TRIE` maps —
-`runtime_allow` and `runtime_block` — while `filter.c` keeps running. No
-rebuild, no reattach. These are checked **first**, before fragment/bogon/
-rate-limit/everything else, and an allow entry always wins over a block
-entry for the same address.
+`xdpctl.py` adds and removes entries in four `BPF_MAP_TYPE_LPM_TRIE` maps —
+`runtime_allow`/`runtime_block` for IPv4, `runtime_allow_v6`/
+`runtime_block_v6` for IPv6 — while `filter.c` keeps running. No rebuild, no
+reattach. `xdpctl.py` picks the right map pair automatically based on
+whether the address/CIDR you pass is v4 or v6. These are checked **first**,
+before fragment/bogon/rate-limit/everything else, and an allow entry always
+wins over a block entry for the same address.
 
 ```bash
 python3 xdpctl.py allow 203.0.113.5          # single IP (implicit /32)
 python3 xdpctl.py allow 203.0.113.0/24       # CIDR block
+python3 xdpctl.py allow 2001:db8::1          # single IPv6 (implicit /128)
+python3 xdpctl.py allow 2001:db8::/32        # IPv6 CIDR block
 python3 xdpctl.py block 198.51.100.7
 python3 xdpctl.py unallow 203.0.113.5        # remove an allow entry
 python3 xdpctl.py unblock 198.51.100.7       # remove a block entry
@@ -594,3 +641,15 @@ sudo bpftool map update name defense_mode key 0 0 0 0 value 1 0 0 0
   range, and allowing it wholesale would make the port scoping close to
   meaningless. If you specifically need it, add it under `GAME_MINECRAFT`
   in `is_legit_port()`.
+- **IPv6 gaps** (see the IPv6 section above for the full rundown):
+  `ENABLE_HANDSHAKE_VERIFY` and `ENABLE_GRE`/`ENABLE_IPIP` trusted-peer
+  scoping are IPv4-only; Google Public NTP's IPv6 addresses aren't in the
+  amplification-exemption list (not documented as stable); the IPv6 bogon
+  list doesn't chase Teredo/6to4/NAT64; `allow-asn`/`block-asn`/
+  `allow-country`/`block-country` in `xdpctl.py` still only resolve to
+  IPv4 CIDR blocks (RIPEstat/ipdeny data used are IPv4-only) — use plain
+  `allow`/`block` with an IPv6 address or CIDR directly instead. The IPv6
+  challenge-reply checksum path (`udp6_checksum()`) and the extension-header
+  walker (`ipv6_find_upper()`) are new code with no compiler/verifier
+  testing available in this environment — extra scrutiny warranted before
+  trusting them in production (see the first bullet above).

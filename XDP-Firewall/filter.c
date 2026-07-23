@@ -6,6 +6,8 @@
 #include <linux/tcp.h>
 #include <linux/in.h>
 #include <linux/icmp.h>
+#include <linux/icmpv6.h>
+#include <linux/in6.h>
 #include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
@@ -22,6 +24,26 @@
 // directly with == . Used by GRE_ALLOWED_SRC/GRE_ALLOWED_DST and the known-
 // public-DNS-resolver allowlist below.
 #define IPV4(a, b, c, d) ((__u32)(a) | ((__u32)(b) << 8) | ((__u32)(c) << 16) | ((__u32)(d) << 24))
+
+// Builds an IPv6 address constant in the same raw-byte (wire-order)
+// representation as ip6->saddr/ip6->daddr, from its 16 individual bytes
+// (write it out the way the address's canonical form reads left-to-right).
+// Used by the known-public-resolver allowlists below. `static const` inside
+// a function does not consume BPF's tight per-function stack budget — it's
+// compile-time data, not a local variable.
+#define IPV6(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) \
+  ((struct in6_addr) { \
+    .s6_addr = { a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p } \
+  })
+
+// Compares two IPv6 addresses as two 64-bit words rather than a 16-byte
+// loop — cheap, and correct regardless of host endianness since both sides
+// are read the same way.
+static inline int ipv6_eq(const struct in6_addr * a, const struct in6_addr * b) {
+  const __u64 * a64 = (const __u64 * )(const void * ) a;
+  const __u64 * b64 = (const __u64 * )(const void * ) b;
+  return a64[0] == b64[0] && a64[1] == b64[1];
+}
 
 // ==== Compile-time service selection ====
 // Define whatever this specific server actually runs, then compile and
@@ -123,6 +145,10 @@
 #ifndef SUBNET_SYN_LIMIT
 #define SUBNET_SYN_LIMIT 500 // new-connection SYNs/sec allowed from one whole subnet
 #endif
+#ifndef SUBNET_MASK_BITS_V6
+#define SUBNET_MASK_BITS_V6 64 // /64 — the standard single-customer IPv6 delegation size;
+                                // MUST be a multiple of 8 (mask_subnet_v6 is byte-aligned only)
+#endif
 
 #ifdef GAME_TALERUNNER
 #ifndef TALERUNNER_PORT
@@ -151,11 +177,22 @@ struct challenge {
 
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __type(key, __u32); // src IP (v4), or a hash for v6
+  __type(key, __u32); // src IP (v4)
   __type(value, struct challenge);
   __uint(max_entries, 1000000);
 }
 challenge_sent SEC(".maps");
+
+// IPv6 sibling of every v4 map below — can't share one map across address
+// sizes, so each gets its own, same value type, same semantics, keyed by
+// struct in6_addr instead of __u32.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct in6_addr);
+  __type(value, struct challenge);
+  __uint(max_entries, 1000000);
+}
+challenge_sent_v6 SEC(".maps");
 
 // LRU_HASH (not per-CPU): a passed challenge must be visible to every core,
 // otherwise a flow that lands on a different queue re-triggers the challenge.
@@ -166,6 +203,14 @@ struct {
   __uint(max_entries, 2000000);
 }
 whitelist SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct in6_addr);
+  __type(value, __u64);
+  __uint(max_entries, 2000000);
+}
+whitelist_v6 SEC(".maps");
 
 // Per-IP adaptive rate limiting / blackhole state
 struct ip_state {
@@ -182,11 +227,20 @@ struct {
 }
 rl_state SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct in6_addr);
+  __type(value, struct ip_state);
+  __uint(max_entries, 2000000);
+}
+rl_state_v6 SEC(".maps");
+
 // Subnet-level new-connection rate state (see SUBNET_MASK_BITS above). Just
 // a rolling window/count, deliberately no blackhole_until like ip_state —
-// a whole /20 can be shared by thousands of real users behind CGNAT, so
-// this only throttles the current window rather than escalating to a
-// lasting block the way a single misbehaving IP does.
+// a whole /20 (v4) or /64 (v6) can be shared by thousands of real users
+// behind CGNAT/a single ISP delegation, so this only throttles the current
+// window rather than escalating to a lasting block the way a single
+// misbehaving IP does.
 struct subnet_state {
   __u64 window_start;
   __u32 pkt_count;
@@ -200,6 +254,14 @@ struct {
 }
 subnet_syn_state SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct in6_addr); // pre-masked to the /64 (see mask_subnet_v6)
+  __type(value, struct subnet_state);
+  __uint(max_entries, 200000);
+}
+subnet_syn_state_v6 SEC(".maps");
+
 // LPM (longest-prefix-match) key for the runtime allow/block lists below.
 // prefixlen MUST be the first field (BPF_MAP_TYPE_LPM_TRIE requirement).
 // addr is a plain IPv4 address in the same raw network-byte-order layout as
@@ -209,6 +271,15 @@ subnet_syn_state SEC(".maps");
 struct ip_key {
   __u32 prefixlen;
   __u32 addr;
+};
+
+// Same idea, IPv6 — prefixlen still first (LPM requirement), then the raw
+// 16-byte address in its normal wire-order representation. A CIDR block
+// here (again including ASN/country-resolved prefixes) is prefixlen=<mask>
+// with the network address; a single IP is prefixlen=128.
+struct ip6_key {
+  __u32 prefixlen;
+  struct in6_addr addr;
 };
 
 // Runtime allowlist — checked first, before every other check in this
@@ -227,6 +298,15 @@ struct {
 }
 runtime_allow SEC(".maps");
 
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, struct ip6_key);
+  __type(value, __u8);
+  __uint(max_entries, 200000);
+}
+runtime_allow_v6 SEC(".maps");
+
 // Runtime blocklist — checked second (after the allowlist, so an allow
 // entry always wins over a block entry for the same address), before
 // everything else. Same key/tag scheme as runtime_allow.
@@ -238,6 +318,15 @@ struct {
   __uint(max_entries, 1000000);
 }
 runtime_block SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, struct ip6_key);
+  __type(value, __u8);
+  __uint(max_entries, 1000000);
+}
+runtime_block_v6 SEC(".maps");
 
 #ifdef ENABLE_HANDSHAKE_VERIFY
 // Shared between the ingress (xdp_anti_ddos) and egress (tcp_egress_track)
@@ -323,7 +412,9 @@ defense_mode SEC(".maps");
 #define ST_MALFORMED_DROP 26 // protocol header claims an impossible size (e.g. UDP len < 8)
 #define ST_LEAK_DROP 27 // blocked a data-leak-prone request (e.g. FiveM /players.json)
 #define ST_UNVERIFIED_DROP 28 // rejected: source hasn't passed a required prior verification step
-#define ST_COUNT 29
+#define ST_IPV6_PASS 29 // aggregate IPv6 pass (family-level visibility; protocol/reason
+#define ST_IPV6_DROP 30 // breakdown above is shared across v4 and v6, not split further)
+#define ST_COUNT 31
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -444,6 +535,41 @@ static inline int is_bogon_source(__u32 saddr) {
   return 0;
 }
 
+// IPv6 bogon/special-use source addresses — the same idea as
+// is_bogon_source() above, for the ranges that actually matter for a
+// public-facing game/voice server: unspecified/loopback, link-local,
+// Unique Local Addresses (the v6 analogue of RFC1918 private space),
+// documentation, and multicast. Deliberately not chasing every entry in
+// IANA's IPv6 special-purpose registry (Teredo, 6to4, NAT64, discard-only,
+// etc.) — those are rare transitional-tunneling edge cases, not a
+// meaningful DDoS source, and chasing all of them isn't worth the extra
+// branches for what this file protects.
+static inline int is_bogon_source_v6(struct in6_addr * addr) {
+  __u8 * b = addr -> s6_addr;
+
+  // :: (unspecified) and ::1 (loopback) — first 15 bytes zero, last byte 0 or 1
+  int first15_zero = 1;
+  #pragma unroll
+  for (int i = 0; i < 15; i++)
+    if (b[i] != 0) first15_zero = 0;
+  if (first15_zero && (b[15] == 0 || b[15] == 1)) return 1;
+
+  // ::ffff:0:0/96 — IPv4-mapped addresses, never a legitimate wire source
+  if (first15_zero == 0) {
+    int first10_zero = 1;
+    #pragma unroll
+    for (int i = 0; i < 10; i++)
+      if (b[i] != 0) first10_zero = 0;
+    if (first10_zero && b[10] == 0xff && b[11] == 0xff) return 1;
+  }
+
+  if (b[0] == 0xfe && (b[1] & 0xc0) == 0x80) return 1; // fe80::/10 link-local
+  if ((b[0] & 0xfe) == 0xfc) return 1; // fc00::/7 Unique Local Address
+  if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8) return 1; // 2001:db8::/32 documentation
+  if (b[0] == 0xff) return 1; // ff00::/8 multicast
+  return 0;
+}
+
 // Invalid TCP flag combinations (null/xmas/nmap-style scans, stack fingerprint
 // probes). No legitimate stack ever sends these — cheap bitmask, zero map access.
 static inline int bogus_tcp_flags(struct tcphdr * tcp) {
@@ -504,9 +630,10 @@ static inline int is_known_bad_udp_payload(void * data, void * data_end) {
 // can legitimately come back with a large EDNS0/DNSSEC answer over the
 // 750-byte amp threshold below; exempting these specific, well-known
 // operators (rather than raising the threshold for everyone) keeps the
-// amplification check meaningful for actual spoofed reflectors. IPv4 only —
-// this program doesn't process IPv6 at all. Add more addresses here if this
-// box also depends on another known-good resolver (e.g. an ISP's own DNS).
+// amplification check meaningful for actual spoofed reflectors. IPv4
+// addresses — see is_known_public_dns_v6() below for the IPv6 ones. Add
+// more addresses here if this box also depends on another known-good
+// resolver (e.g. an ISP's own DNS).
 static inline int is_known_public_dns(__u32 src_ip) {
   // Google
   if (src_ip == IPV4(8, 8, 8, 8) || src_ip == IPV4(8, 8, 4, 4)) return 1;
@@ -525,6 +652,41 @@ static inline int is_known_public_dns(__u32 src_ip) {
   return 0;
 }
 
+// Same providers as is_known_public_dns() above, their IPv6 addresses.
+static inline int is_known_public_dns_v6(struct in6_addr * src_ip) {
+  static const struct in6_addr google_dns_1 = IPV6(0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88);
+  static const struct in6_addr google_dns_2 = IPV6(0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x44);
+  static const struct in6_addr cf_std_1 = IPV6(0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x11);
+  static const struct in6_addr cf_std_2 = IPV6(0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01);
+  static const struct in6_addr cf_malware_1 = IPV6(0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x12);
+  static const struct in6_addr cf_malware_2 = IPV6(0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02);
+  static const struct in6_addr cf_family_1 = IPV6(0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x13);
+  static const struct in6_addr cf_family_2 = IPV6(0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x03);
+  static const struct in6_addr quad9_secured_1 = IPV6(0x26, 0x20, 0x00, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe);
+  static const struct in6_addr quad9_secured_2 = IPV6(0x26, 0x20, 0x00, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09);
+  static const struct in6_addr quad9_unsecured_1 = IPV6(0x26, 0x20, 0x00, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10);
+  static const struct in6_addr quad9_unsecured_2 = IPV6(0x26, 0x20, 0x00, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x00, 0x10);
+  static const struct in6_addr quad9_ecs_1 = IPV6(0x26, 0x20, 0x00, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11);
+  static const struct in6_addr quad9_ecs_2 = IPV6(0x26, 0x20, 0x00, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x00, 0x11);
+  static const struct in6_addr adguard_default_1 = IPV6(0x2a, 0x10, 0x50, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xd1, 0x00, 0xff);
+  static const struct in6_addr adguard_default_2 = IPV6(0x2a, 0x10, 0x50, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xd2, 0x00, 0xff);
+  static const struct in6_addr adguard_family_1 = IPV6(0x2a, 0x10, 0x50, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xba, 0xd1, 0x00, 0xff);
+  static const struct in6_addr adguard_family_2 = IPV6(0x2a, 0x10, 0x50, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xba, 0xd2, 0x00, 0xff);
+  static const struct in6_addr adguard_nofilter_1 = IPV6(0x2a, 0x10, 0x50, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0xff);
+  static const struct in6_addr adguard_nofilter_2 = IPV6(0x2a, 0x10, 0x50, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0xff);
+
+  return ipv6_eq(src_ip, & google_dns_1) || ipv6_eq(src_ip, & google_dns_2) ||
+    ipv6_eq(src_ip, & cf_std_1) || ipv6_eq(src_ip, & cf_std_2) ||
+    ipv6_eq(src_ip, & cf_malware_1) || ipv6_eq(src_ip, & cf_malware_2) ||
+    ipv6_eq(src_ip, & cf_family_1) || ipv6_eq(src_ip, & cf_family_2) ||
+    ipv6_eq(src_ip, & quad9_secured_1) || ipv6_eq(src_ip, & quad9_secured_2) ||
+    ipv6_eq(src_ip, & quad9_unsecured_1) || ipv6_eq(src_ip, & quad9_unsecured_2) ||
+    ipv6_eq(src_ip, & quad9_ecs_1) || ipv6_eq(src_ip, & quad9_ecs_2) ||
+    ipv6_eq(src_ip, & adguard_default_1) || ipv6_eq(src_ip, & adguard_default_2) ||
+    ipv6_eq(src_ip, & adguard_family_1) || ipv6_eq(src_ip, & adguard_family_2) ||
+    ipv6_eq(src_ip, & adguard_nofilter_1) || ipv6_eq(src_ip, & adguard_nofilter_2);
+}
+
 // Well-known public NTP servers — Google Public NTP (time.google.com and
 // time1-4.google.com all resolve within this /24) and Cloudflare Time
 // Services (time.cloudflare.com). Exempted from the 200-byte NTP amp
@@ -535,6 +697,18 @@ static inline int is_known_public_ntp(__u32 src_ip) {
     src_ip == IPV4(216, 239, 35, 8) || src_ip == IPV4(216, 239, 35, 12)) return 1; // Google
   if (src_ip == IPV4(162, 159, 200, 1) || src_ip == IPV4(162, 159, 200, 123)) return 1; // Cloudflare
   return 0;
+}
+
+// Cloudflare Time Services' IPv6 addresses only — Google Public NTP's IPv6
+// addresses are not documented as stable (anycast, resolved live, no
+// published static list the way the IPv4 /24 is), so they're deliberately
+// not hardcoded here rather than guessed at. A real Google NTP reply over
+// IPv6 still gets checked by the plain 200-byte threshold, just without
+// this specific exemption.
+static inline int is_known_public_ntp_v6(struct in6_addr * src_ip) {
+  static const struct in6_addr cf_ntp_1 = IPV6(0x26, 0x06, 0x47, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01);
+  static const struct in6_addr cf_ntp_2 = IPV6(0x26, 0x06, 0x47, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x23);
+  return ipv6_eq(src_ip, & cf_ntp_1) || ipv6_eq(src_ip, & cf_ntp_2);
 }
 
 // Known UDP reflection/amplification patterns, keyed by the packet's claimed
@@ -565,6 +739,17 @@ static inline int is_amp_flood(struct udphdr * udp, void * data_end, __u32 src_i
     sport == 1900 || // SSDP
     sport == 11211 || // memcached
     sport == 37810; // known reflector port, carried over from original config
+}
+
+// Same as is_amp_flood() above, checking the IPv6 known-resolver lists.
+static inline int is_amp_flood_v6(struct udphdr * udp, void * data_end, struct in6_addr * src_ip) {
+  __u16 sport = bpf_ntohs(udp -> source);
+  __u32 len = (__u32)(data_end - (void * )(udp + 1));
+
+  if (sport == 53) return len > 750 && !is_known_public_dns_v6(src_ip);
+  if (sport == 123) return len > 200 && !is_known_public_ntp_v6(src_ip);
+  return sport == 19 || sport == 111 || sport == 161 || sport == 389 ||
+    sport == 1900 || sport == 11211 || sport == 37810;
 }
 #endif
 
@@ -619,6 +804,105 @@ static inline __u16 ip_checksum(struct iphdr * ip) {
   return ~csum;
 }
 
+// UDP checksum over IPv6's pseudo-header + UDP header + payload. IPv6 has
+// no header-level checksum at all (unlike IPv4), so the UDP checksum is
+// mandatory (RFC 8200) — there's no "set it to 0" option the way the IPv4
+// challenge reply uses. len_bytes is the UDP header+payload length in
+// bytes (a small, fixed value here — just the 8-byte UDP header + 4-byte
+// cookie — so the whole thing safely fits the same fixed 16-bit-word-pair
+// summing approach ip_checksum() uses, just over a different, larger
+// pseudo-header).
+static inline __u16 udp6_checksum(struct in6_addr * saddr, struct in6_addr * daddr, struct udphdr * udp, __u16 len_bytes) {
+  __u32 csum = 0;
+  __u16 * sp = (__u16 * ) saddr;
+  __u16 * dp = (__u16 * ) daddr;
+
+  #pragma unroll
+  for (int i = 0; i < 8; i++) csum += sp[i];
+  #pragma unroll
+  for (int i = 0; i < 8; i++) csum += dp[i];
+
+  csum += bpf_htons(len_bytes); // upper-layer packet length (pseudo-header)
+  csum += bpf_htons(IPPROTO_UDP); // next header (pseudo-header)
+
+  udp -> check = 0;
+  __u16 * up = (__u16 * ) udp;
+  #pragma unroll
+  for (int i = 0; i < 6; i++) csum += up[i]; // 8-byte UDP header + 4-byte cookie = 12 bytes = 6 words
+
+  csum = (csum & 0xffff) + (csum >> 16);
+  csum = (csum & 0xffff) + (csum >> 16);
+  __u16 result = ~csum;
+  return result == 0 ? 0xffff : result; // RFC 8200: a computed 0 must be sent as all-ones
+}
+
+// A sentinel struct returned by ipv6_find_upper() below to report both the
+// real upper-layer protocol (if found) and where its header starts.
+struct ip6_upper {
+  __u8 proto; // IPPROTO_TCP/UDP/ICMPV6 if resolved, or a sentinel:
+              //   0xFF = hit ESP/AH/an unknown extension header, or a
+              //          truncated/malformed chain — give up and PASS.
+              //          Can't inspect further (ESP/AH payload is opaque
+              //          or unfamiliar), and would rather risk missing a
+              //          rare attack shape than break real IPsec traffic.
+              //   0xFE = a Fragment extension header was seen — DROP,
+              //          mirrors the IPv4 fragment policy exactly.
+              //   0xFD = more than IPV6_MAX_EXT_HEADERS extension headers
+              //          chained — DROP. Real traffic essentially never
+              //          needs this many; it's a known evasion shape.
+  void * hdr;
+};
+
+#define IPV6_MAX_EXT_HEADERS 4
+
+// Bounded walk of IPv6 extension headers (Hop-by-Hop Options, Destination
+// Options, Routing) to find the real upper-layer protocol. IPv6 moves
+// fragmentation into its own extension header instead of base-header
+// fields the way IPv4 does, so "is this fragmented" has to be answered
+// here rather than with a single field check.
+static inline struct ip6_upper ipv6_find_upper(struct ipv6hdr * ip6, void * data_end) {
+  struct ip6_upper result = {
+    .proto = 0xfd,
+    .hdr = NULL
+  };
+  __u8 next = ip6 -> nexthdr;
+  void * cur = (void * )(ip6 + 1);
+
+  #pragma unroll
+  for (int i = 0; i < IPV6_MAX_EXT_HEADERS; i++) {
+    if (next == IPPROTO_TCP || next == IPPROTO_UDP || next == IPPROTO_ICMPV6) {
+      result.proto = next;
+      result.hdr = cur;
+      return result;
+    }
+    if (next == 44) { // Fragment header
+      result.proto = 0xfe;
+      return result;
+    }
+    if (next == 0 || next == 60 || next == 43) { // Hop-by-Hop, Destination Options, Routing
+      if (cur + 2 > data_end) {
+        result.proto = 0xff;
+        return result;
+      }
+      __u8 * hdr = (__u8 * ) cur;
+      __u8 hdr_next = hdr[0];
+      __u8 hdr_len = hdr[1];
+      void * next_hdr = cur + ((int)hdr_len + 1) * 8;
+      if (next_hdr > data_end) {
+        result.proto = 0xff;
+        return result;
+      }
+      next = hdr_next;
+      cur = next_hdr;
+      continue;
+    }
+    // ESP, AH, or anything else unrecognized — can't safely parse further.
+    result.proto = 0xff;
+    return result;
+  }
+  return result; // loop exhausted without resolving — proto stays 0xfd
+}
+
 // Adaptive per-IP rate limit. Returns 1 if the packet should be dropped
 // (blackholed, or the IP exceeded the limit for the current defense mode).
 // `weight` lets a caller spend more of the shared budget per packet (e.g. a
@@ -658,6 +942,45 @@ static inline int rate_limited(__u32 src_ip, __u64 now, __u32 weight) {
   return 0;
 }
 
+// Same as rate_limited() above, against rl_state_v6 instead — duplicated
+// rather than parameterized by map, since passing a BPF map reference
+// through a function argument isn't portable across verifier versions.
+// Shares the same defense_mode/pps_limits budget as the v4 path.
+static inline int rate_limited_v6(struct in6_addr * src_ip, __u64 now, __u32 weight) {
+  __u32 mkey = 0;
+  __u32 * mode = bpf_map_lookup_elem( & defense_mode, & mkey);
+  __u32 idx = 0;
+  if (mode && * mode < 3) idx = * mode;
+  __u32 limit = pps_limits[idx];
+
+  struct ip_state * st = bpf_map_lookup_elem( & rl_state_v6, src_ip);
+  if (st) {
+    if (st -> blackhole_until && now < st -> blackhole_until)
+      return 1;
+    if (now - st -> window_start > RL_WINDOW_NS) {
+      st -> window_start = now;
+      st -> pkt_count = weight;
+      st -> blackhole_until = 0;
+      return 0;
+    }
+    st -> pkt_count += weight;
+    if (st -> pkt_count > limit) {
+      st -> blackhole_until = now + BLACKHOLE_NS;
+      bump_stat(ST_BLACKHOLE);
+      return 1;
+    }
+    return 0;
+  }
+
+  struct ip_state new_st = {
+    .window_start = now,
+    .pkt_count = weight,
+    .blackhole_until = 0
+  };
+  bpf_map_update_elem( & rl_state_v6, src_ip, & new_st, BPF_ANY);
+  return 0;
+}
+
 // Rough p0f-style OS bucketing from the SYN's own IP/TCP header — not full
 // signature matching (see pf.os), just "does this look like a real client
 // stack, and is it Windows-shaped (the common case) or not". Real player
@@ -671,6 +994,16 @@ static inline __u32 syn_weight(struct iphdr * ip, struct tcphdr * tcp) {
   return 4; // rare bucket (router/embedded/Solaris-shaped) — stricter
 }
 
+// Same idea as syn_weight() above, using hop_limit (IPv6's name for the
+// same field TTL is in IPv4).
+static inline __u32 syn_weight_v6(struct ipv6hdr * ip6, struct tcphdr * tcp) {
+  if (ip6 -> hop_limit > 250 || bpf_ntohs(tcp -> window) == 0)
+    return 50;
+  if (ip6 -> hop_limit <= 64) return 4;
+  if (ip6 -> hop_limit <= 128) return 1;
+  return 4;
+}
+
 // A real OS's SYN is never exactly 40 bytes of IP-total-length (that's a
 // bare 20-byte IP + 20-byte TCP header with zero options — every real stack
 // sends at least MSS) and never much over ~64 bytes either (that's already
@@ -680,6 +1013,15 @@ static inline __u32 syn_weight(struct iphdr * ip, struct tcphdr * tcp) {
 static inline int bad_syn_length(struct iphdr * ip) {
   __u16 total_len = bpf_ntohs(ip -> tot_len);
   return total_len == 40 || total_len > 64;
+}
+
+// Same idea, IPv6 — but ipv6hdr's payload_len is the length of everything
+// AFTER the fixed 40-byte base header (unlike IPv4's tot_len, which
+// includes the IP header itself), so the equivalent bare-TCP-header size is
+// 20, not 40, and the generous upper bound is 44, not 64.
+static inline int bad_syn_length_v6(struct ipv6hdr * ip6) {
+  __u16 payload_len = bpf_ntohs(ip6 -> payload_len);
+  return payload_len == 20 || payload_len > 44;
 }
 
 // Masks a wire-order IPv4 address (see IPV4() above) down to its top
@@ -701,6 +1043,17 @@ static inline __u32 mask_subnet(__u32 addr) {
     else if (byte_bits < 8) b[i] &= (__u8)(0xff << (8 - byte_bits));
   }
   return (__u32) b[0] | ((__u32) b[1] << 8) | ((__u32) b[2] << 16) | ((__u32) b[3] << 24);
+}
+
+// Same idea for IPv6, zeroing out everything past SUBNET_MASK_BITS_V6.
+// Byte-aligned only (SUBNET_MASK_BITS_V6 must be a multiple of 8) — every
+// realistic IPv6 delegation size (/48, /56, /64) already is, so this
+// doesn't need mask_subnet()'s bit-level generality.
+static inline void mask_subnet_v6(struct in6_addr * addr, struct in6_addr * out) {
+  int keep_bytes = SUBNET_MASK_BITS_V6 / 8;
+  #pragma unroll
+  for (int i = 0; i < 16; i++)
+    out -> s6_addr[i] = (i < keep_bytes) ? addr -> s6_addr[i] : 0;
 }
 
 // Subnet-level (not just per-IP) new-connection rate check — catches a
@@ -727,12 +1080,40 @@ static inline int subnet_syn_flood(__u32 src_ip, __u64 now) {
   return 0;
 }
 
+// Same as subnet_syn_flood() above, against subnet_syn_state_v6.
+static inline int subnet_syn_flood_v6(struct in6_addr * src_ip, __u64 now) {
+  struct in6_addr subnet;
+  mask_subnet_v6(src_ip, & subnet);
+  struct subnet_state * st = bpf_map_lookup_elem( & subnet_syn_state_v6, & subnet);
+  if (st) {
+    if (now - st -> window_start > RL_WINDOW_NS) {
+      st -> window_start = now;
+      st -> pkt_count = 1;
+      return 0;
+    }
+    st -> pkt_count++;
+    return st -> pkt_count > SUBNET_SYN_LIMIT;
+  }
+  struct subnet_state new_st = {
+    .window_start = now,
+    .pkt_count = 1
+  };
+  bpf_map_update_elem( & subnet_syn_state_v6, & subnet, & new_st, BPF_ANY);
+  return 0;
+}
+
 // ICMP echo-request (ping) is common, expected traffic (monitoring, path
 // checks); other ICMP types arriving unsolicited are rarer and more often
 // signal abuse (e.g. spoofed error floods) — same weighted-budget idea as
 // syn_weight(), just for ICMP.
 static inline __u32 icmp_weight(struct icmphdr * icmp) {
   return icmp -> type == ICMP_ECHO ? 1 : 4;
+}
+
+// Same idea for ICMPv6 — note the echo-request type value is different
+// from ICMPv4's (128, not 8).
+static inline __u32 icmpv6_weight(struct icmp6hdr * icmp6) {
+  return icmp6 -> icmp6_type == ICMPV6_ECHO_REQUEST ? 1 : 4;
 }
 
 // Checks whether the payload "looks legit" for a given protocol (first few bytes)
@@ -1374,6 +1755,342 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         return XDP_DROP;
       }
       bump_stat(ST_PASS);
+      bump_stat(ST_OTHER_PASS);
+    }
+  } else if (eth -> h_proto == bpf_htons(ETH_P_IPV6)) {
+    struct ipv6hdr * ip6 = data + sizeof( * eth);
+    if ((void * )(ip6 + 1) > data_end) return XDP_ACCEPT;
+
+    // Runtime allow/block lists (IPv6) — same semantics as the v4 ones:
+    // checked first, ahead of everything else, allow always wins over
+    // block for the same address.
+    {
+      struct ip6_key key = {
+        .prefixlen = 128,
+        .addr = ip6 -> saddr
+      };
+      if (bpf_map_lookup_elem( & runtime_allow_v6, & key)) {
+        bump_stat(ST_IPV6_PASS);
+        bump_stat(ST_RUNTIME_ALLOW);
+        return XDP_ACCEPT;
+      }
+      if (bpf_map_lookup_elem( & runtime_block_v6, & key)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_RUNTIME_BLOCK);
+        return XDP_DROP;
+      }
+    }
+
+    if (is_bogon_source_v6( & ip6 -> saddr)) {
+      bump_stat(ST_IPV6_DROP);
+      bump_stat(ST_BOGON_DROP);
+      return XDP_DROP;
+    }
+
+    struct ip6_upper upper = ipv6_find_upper(ip6, data_end);
+    if (upper.proto == 0xfe) { // Fragment extension header — mirrors the IPv4 fragment policy
+      bump_stat(ST_IPV6_DROP);
+      bump_stat(ST_FRAG_DROP);
+      return XDP_DROP;
+    }
+    if (upper.proto == 0xfd) { // more extension headers than any real traffic needs
+      bump_stat(ST_IPV6_DROP);
+      bump_stat(ST_FRAG_DROP); // same bucket: header-shape evasion, not a distinct new reason
+      return XDP_DROP;
+    }
+    if (upper.proto == 0xff) { // ESP/AH/unknown/truncated — can't inspect, don't break it
+      bump_stat(ST_IPV6_PASS);
+      return XDP_ACCEPT;
+    }
+
+    if (upper.proto == IPPROTO_UDP) {
+      struct udphdr * udp = upper.hdr;
+      if ((void * )(udp + 1) > data_end) return XDP_ACCEPT;
+
+      if (bpf_ntohs(udp -> len) < sizeof( * udp)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_MALFORMED_DROP);
+        return XDP_DROP;
+      }
+
+      if (is_ascii_garbage_flood((void * )(udp + 1), data_end)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_GARBAGE_DROP);
+        return XDP_DROP;
+      }
+
+      if (is_known_bad_udp_payload((void * )(udp + 1), data_end)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_BADPAYLOAD_DROP);
+        return XDP_DROP;
+      }
+
+#ifdef ENABLE_AMP_PROTECTION
+      if (is_amp_flood_v6(udp, data_end, & ip6 -> saddr)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_AMP_DROP);
+        return XDP_DROP;
+      }
+#endif
+
+      __u16 dport = bpf_ntohs(udp -> dest);
+
+      if (!is_legit_port(dport)) {
+        struct in6_addr src_ip = ip6 -> saddr;
+        __u64 ts = bpf_ktime_get_ns();
+        if (rate_limited_v6( & src_ip, ts, 1)) {
+          bump_stat(ST_IPV6_DROP);
+          bump_stat(ST_UDP_DROP);
+          bump_stat(ST_RATELIMIT_DROP);
+          return XDP_DROP;
+        }
+        bump_stat(ST_IPV6_PASS);
+        bump_stat(ST_UDP_PASS);
+        return XDP_ACCEPT; // not our port → kernel
+      }
+
+      __u16 sport = bpf_ntohs(udp -> source);
+      if (dport != 53 && sport != 0 && sport < 1024) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_REFLECT_DROP);
+        return XDP_DROP;
+      }
+
+#ifdef GAME_FIVEM
+      if (sport == 30120 && dport == 30120) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_REFLECT_DROP);
+        return XDP_DROP;
+      }
+#endif
+
+      struct in6_addr src_ip = ip6 -> saddr;
+      __u64 ts = bpf_ktime_get_ns();
+
+      if (rate_limited_v6( & src_ip, ts, 1)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_RATELIMIT_DROP);
+        return XDP_DROP;
+      }
+
+      __u64 * wl_ts = bpf_map_lookup_elem( & whitelist_v6, & src_ip);
+      if (wl_ts && ts - * wl_ts < WHITELIST_TTL_NS) {
+        bump_stat(ST_IPV6_PASS);
+        bump_stat(ST_UDP_PASS);
+        return XDP_ACCEPT;
+      }
+
+      void * payload = (void * )(udp + 1);
+      int legit = payload_looks_legit(payload, data_end, dport);
+
+      if (data_end - payload >= 4) {
+        __u32 * maybe_cookie = payload;
+        struct challenge * ch = bpf_map_lookup_elem( & challenge_sent_v6, & src_ip);
+        if (ch && ch -> cookie == * maybe_cookie && ts - ch -> timestamp < 5000000000ULL) { // 5s
+          bpf_map_update_elem( & whitelist_v6, & src_ip, & ts, BPF_ANY);
+          bpf_map_delete_elem( & challenge_sent_v6, & src_ip);
+          bump_stat(ST_IPV6_PASS);
+          bump_stat(ST_UDP_PASS);
+          return XDP_ACCEPT;
+        }
+      }
+
+      if (legit) {
+        __u32 cookie = gen_cookie(udp -> source, ts);
+        struct challenge ch = {
+          .timestamp = ts,
+          .cookie = cookie
+        };
+        bpf_map_update_elem( & challenge_sent_v6, & src_ip, & ch, BPF_ANY);
+
+        // Same idea as the IPv4 challenge reply, with three real
+        // differences: a fixed 40-byte header instead of 20, address swap
+        // via a 16-byte struct copy instead of a 32-bit scalar swap, and
+        // no IP-level checksum to compute (IPv6 doesn't have one) — but the
+        // UDP checksum, optional and left at 0 for the v4 reply, is
+        // mandatory here (see udp6_checksum()).
+        __u8 src_mac[6], dst_mac[6];
+        __builtin_memcpy(src_mac, eth -> h_source, 6);
+        __builtin_memcpy(dst_mac, eth -> h_dest, 6);
+        struct in6_addr daddr6 = ip6 -> daddr, saddr6 = ip6 -> saddr;
+        __be16 sport_be = udp -> source, rdport_be = udp -> dest;
+
+        int new_len = (int) sizeof( * eth) + (int) sizeof( * ip6) + (int) sizeof( * udp) + 4;
+        int diff = new_len - (int)(data_end - data);
+        if (bpf_xdp_adjust_tail(ctx, diff))
+          return XDP_DROP;
+
+        data = (void * )(long) ctx -> data;
+        data_end = (void * )(long) ctx -> data_end;
+        if (data + new_len > data_end)
+          return XDP_DROP;
+
+        eth = data;
+        __builtin_memcpy(eth -> h_dest, src_mac, 6);
+        __builtin_memcpy(eth -> h_source, dst_mac, 6);
+
+        ip6 = data + sizeof( * eth);
+        ip6 -> hop_limit = 64;
+        ip6 -> saddr = daddr6;
+        ip6 -> daddr = saddr6;
+        ip6 -> payload_len = bpf_htons(sizeof( * udp) + 4);
+        ip6 -> nexthdr = IPPROTO_UDP;
+
+        udp = (void * )(ip6 + 1);
+        udp -> source = rdport_be;
+        udp -> dest = sport_be;
+        udp -> len = bpf_htons(sizeof( * udp) + 4);
+
+        __u32 * cookie_out = (void * )(udp + 1);
+        if ((void * )(cookie_out + 1) > data_end)
+          return XDP_DROP;
+        * cookie_out = cookie;
+
+        udp -> check = udp6_checksum( & ip6 -> saddr, & ip6 -> daddr, udp, sizeof( * udp) + 4);
+
+        bump_stat(ST_CHALLENGE);
+        return XDP_TX;
+      }
+
+      bump_stat(ST_IPV6_DROP);
+      bump_stat(ST_UDP_DROP);
+      return XDP_DROP;
+    }
+
+    if (upper.proto == IPPROTO_TCP) {
+      struct tcphdr * tcp = upper.hdr;
+      if ((void * )(tcp + 1) > data_end) return XDP_ACCEPT;
+
+      if (bogus_tcp_flags(tcp)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_TCP_DROP);
+        bump_stat(ST_BADFLAGS_DROP);
+        return XDP_DROP;
+      }
+
+      // ENABLE_HANDSHAKE_VERIFY is IPv4-only for now (see FILTER.md) —
+      // no tcp_handshake_v6 map, nothing to check here yet.
+
+#ifdef GAME_RAN
+      void * tcp_payload6 = (void * ) tcp + (tcp -> doff * 4); // account for TCP options
+      if (is_known_bad_tcp_payload(tcp_payload6, data_end)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_TCP_DROP);
+        bump_stat(ST_EXPLOIT_DROP);
+        return XDP_DROP;
+      }
+#endif
+
+#ifdef GAME_FIVEM
+      __u16 fivem_dport6 = bpf_ntohs(tcp -> dest);
+      if (fivem_dport6 >= 30000 && fivem_dport6 <= 32000) {
+        if (tcp -> syn && !tcp -> ack) {
+          struct in6_addr fivem_src6 = ip6 -> saddr;
+          __u64 * fivem_wl6 = bpf_map_lookup_elem( & whitelist_v6, & fivem_src6);
+          __u64 fivem_now6 = bpf_ktime_get_ns();
+          if (!fivem_wl6 || fivem_now6 - * fivem_wl6 >= WHITELIST_TTL_NS) {
+            bump_stat(ST_IPV6_DROP);
+            bump_stat(ST_TCP_DROP);
+            bump_stat(ST_UNVERIFIED_DROP);
+            return XDP_DROP;
+          }
+        } else if (!tcp -> syn) {
+          void * http_payload6 = (void * ) tcp + (tcp -> doff * 4);
+          if (is_players_json_request(http_payload6, data_end)) {
+            bump_stat(ST_IPV6_DROP);
+            bump_stat(ST_TCP_DROP);
+            bump_stat(ST_LEAK_DROP);
+            return XDP_DROP;
+          }
+        }
+      }
+#endif
+
+#ifdef GAME_TS3
+      if (tcp -> syn && !tcp -> ack && bpf_ntohs(tcp -> dest) == 30033) {
+        struct in6_addr ts3_src6 = ip6 -> saddr;
+        __u64 * ts3_wl6 = bpf_map_lookup_elem( & whitelist_v6, & ts3_src6);
+        __u64 ts3_now6 = bpf_ktime_get_ns();
+        if (!ts3_wl6 || ts3_now6 - * ts3_wl6 >= WHITELIST_TTL_NS) {
+          bump_stat(ST_IPV6_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_UNVERIFIED_DROP);
+          return XDP_DROP;
+        }
+      }
+#endif
+
+      if (tcp -> syn && !tcp -> ack) {
+        bump_stat(ST_TCP_SYN);
+
+        if (bad_syn_length_v6(ip6)) {
+          bump_stat(ST_IPV6_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_BADSYN_LEN_DROP);
+          return XDP_DROP;
+        }
+
+        struct in6_addr src_ip6 = ip6 -> saddr;
+        __u64 ts6 = bpf_ktime_get_ns();
+
+        if (subnet_syn_flood_v6( & src_ip6, ts6)) {
+          bump_stat(ST_IPV6_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_SUBNET_DROP);
+          return XDP_DROP;
+        }
+
+        if (rate_limited_v6( & src_ip6, ts6, syn_weight_v6(ip6, tcp))) {
+          bump_stat(ST_IPV6_DROP);
+          bump_stat(ST_TCP_DROP);
+          bump_stat(ST_RATELIMIT_DROP);
+          return XDP_DROP;
+        }
+        bump_stat(ST_IPV6_PASS);
+        bump_stat(ST_TCP_PASS);
+      }
+    }
+
+    // ICMPv6 flood protection — same shared per-IP budget idea as ICMPv4,
+    // note the different echo-request type value (see icmpv6_weight()).
+    if (upper.proto == IPPROTO_ICMPV6) {
+      struct icmp6hdr * icmp6 = upper.hdr;
+      __u32 weight = 1;
+      if ((void * )(icmp6 + 1) <= data_end) weight = icmpv6_weight(icmp6);
+
+      struct in6_addr src_ip6 = ip6 -> saddr;
+      __u64 ts6 = bpf_ktime_get_ns();
+      if (rate_limited_v6( & src_ip6, ts6, weight)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_ICMP_DROP);
+        bump_stat(ST_RATELIMIT_DROP);
+        return XDP_DROP;
+      }
+      bump_stat(ST_IPV6_PASS);
+      bump_stat(ST_ICMP_PASS);
+    }
+
+    // GRE/IPIP trusted-peer scoping (ENABLE_GRE/ENABLE_IPIP's
+    // *_ALLOWED_SRC/DST) is IPv4-only for now (see FILTER.md) —
+    // IPv6-encapsulated GRE/IPIP, or anything else unrecognized, just
+    // falls into the same rate-limited catch-all as any other protocol.
+    if (upper.proto != IPPROTO_UDP && upper.proto != IPPROTO_TCP && upper.proto != IPPROTO_ICMPV6) {
+      struct in6_addr src_ip6 = ip6 -> saddr;
+      __u64 ts6 = bpf_ktime_get_ns();
+      if (rate_limited_v6( & src_ip6, ts6, 1)) {
+        bump_stat(ST_IPV6_DROP);
+        bump_stat(ST_OTHER_DROP);
+        bump_stat(ST_RATELIMIT_DROP);
+        return XDP_DROP;
+      }
+      bump_stat(ST_IPV6_PASS);
       bump_stat(ST_OTHER_PASS);
     }
   }
