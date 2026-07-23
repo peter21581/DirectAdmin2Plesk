@@ -131,7 +131,7 @@ struct challenge {
 
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __type(key, __u32); // src IP (v4) ili hash za v6
+  __type(key, __u32); // src IP (v4), or a hash for v6
   __type(value, struct challenge);
   __uint(max_entries, 1000000);
 }
@@ -142,7 +142,7 @@ challenge_sent SEC(".maps");
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __type(key, __u32);
-  __type(value, __u64); // timestamp kad je prošao challenge
+  __type(value, __u64); // timestamp of when the challenge was passed
   __uint(max_entries, 2000000);
 }
 whitelist SEC(".maps");
@@ -283,7 +283,7 @@ static __u32 pps_limits[3] = {
 #define TS3_PORT_MIN 9000
 #define TS3_PORT_MAX 10500
 
-// dport se očekuje u host redosledu (već konvertovan pozivaocem)
+// dport is expected in host byte order (already converted by the caller)
 static inline int is_legit_port(__u16 dport) {
 #ifdef ENABLE_DNS
   if (dport == 53) return 1;
@@ -343,7 +343,7 @@ static inline int is_legit_port(__u16 dport) {
   return 0;
 }
 
-// Generiše random cookie (koristi src port + time)
+// Generates a random cookie (uses src port + time)
 static inline __u32 gen_cookie(__u16 src_port, __u64 ts) {
   return bpf_get_prandom_u32() ^ src_port ^ (ts & 0xffffffff);
 }
@@ -538,10 +538,10 @@ static inline __u16 ip_checksum(struct iphdr * ip) {
   return ~csum;
 }
 
-// Adaptivni per-IP rate limit. Vraća 1 ako paket treba dropovati
-// (blackholed ili je IP prešao limit za trenutni defense mode). `weight`
-// lets a caller spend more of the shared budget per packet (e.g. a SYN whose
-// TCP/IP shape doesn't look like a real client stack).
+// Adaptive per-IP rate limit. Returns 1 if the packet should be dropped
+// (blackholed, or the IP exceeded the limit for the current defense mode).
+// `weight` lets a caller spend more of the shared budget per packet (e.g. a
+// SYN whose TCP/IP shape doesn't look like a real client stack).
 static inline int rate_limited(__u32 src_ip, __u64 now, __u32 weight) {
   __u32 mkey = 0;
   __u32 * mode = bpf_map_lookup_elem( & defense_mode, & mkey);
@@ -654,7 +654,7 @@ static inline __u32 icmp_weight(struct icmphdr * icmp) {
   return icmp -> type == ICMP_ECHO ? 1 : 4;
 }
 
-// Provera da li je payload "legit" za određeni protokol (prvih par bajtova)
+// Checks whether the payload "looks legit" for a given protocol (first few bytes)
 static inline int payload_looks_legit(void * data, void * data_end, __u16 dport) {
 #ifdef ENABLE_DNS
   if (dport == 53) {
@@ -713,7 +713,7 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
 #endif
 
 #ifdef GAME_ALTV
-  // obično 7788 UDP, ali i u 7000-8999 range
+  // usually 7788 UDP, but also within the 7000-8999 range
   if (dport == 7788 || (dport >= 7000 && dport <= 8999)) {
     if (data + 4 <= data_end) {
       if ( * (__u32 * ) data == 0x544C41) // "ALT\0" little-endian
@@ -744,14 +744,14 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
 #ifdef GAME_MORDHAU
   // frequently in 7000-8999 + 15000
   if ((dport >= 7000 && dport <= 8999) || dport == 15000 || dport == 7777 || dport == 27015) {
-    // Mordhau beacon: počinje sa 0x00 0x00 0x00 0x00 ili 0x01 0x00 0x00 0x00
+    // Mordhau beacon: starts with 0x00 0x00 0x00 0x00 or 0x01 0x00 0x00 0x00
     if (data + 4 <= data_end && * (__u32 * ) data <= 0x00000001)
       return 1;
   }
 #endif
 
 #ifdef GAME_SQUAD
-  // često 7787, 21114, 27165 itd.
+  // often 7787, 21114, 27165, etc.
   if (dport == 7787 || dport == 21114 || dport == 27165 || (dport >= 7000 && dport <= 8999)) {
     if (data + 2 <= data_end && * (__u16 * ) data == 0x0000)
       return 1;
@@ -766,8 +766,8 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
 #endif
 
 #ifdef GAME_ARK
-  // query port = gameport + 15000, npr. 7777 + 15000 = 22777
-  if (dport >= 19132 && dport <= 65535) { // ARK query portovi su visoki
+  // query port = gameport + 15000, e.g. 7777 + 15000 = 22777
+  if (dport >= 19132 && dport <= 65535) { // ARK query ports are high/dynamic
     if (data + 4 <= data_end && * (__u32 * ) data == 0xffffffff)
       return 1; // Source engine query (TSource Engine Query, A2S, etc.)
     if (data + 4 <= data_end && * (__u32 * ) data == 0x31305356)
@@ -776,11 +776,11 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
 #endif
 
 #ifdef GAME_UNTURNED
-  // RakNet-based, često 27015-27030
+  // RakNet-based, often 27015-27030
   if (dport >= 27015 && dport <= 27030) {
     if (data + 1 <= data_end) {
       __u8 id = * (__u8 * ) data;
-      // Unturned offline message ID: 0x05 - 0x0E su legit
+      // Unturned offline message ID: 0x05-0x0E are legit
       if (id >= 0x05 && id <= 0x0E)
         return 1;
     }
@@ -801,7 +801,7 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
   if (dport == TALERUNNER_PORT)
     return data + 4 <= data_end && ( * (__u32 * ) data & 0x00ffffff) == 0x003eff04;
 #endif
-  return 1; // ostali protokoli – prihvatamo prvi paket
+  return 1; // other protocols – we accept the first packet
 }
 
 SEC("xdp")
@@ -913,7 +913,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         }
         bump_stat(ST_PASS);
         bump_stat(ST_UDP_PASS);
-        return XDP_ACCEPT; // nije naš port → kernel
+        return XDP_ACCEPT; // not our port → kernel
       }
 
       // Reflected/amplified UDP (memcached, NTP monlist, chargen, SSDP, ...)
@@ -932,7 +932,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();
 
-      // Adaptivni rate limit / auto-blackhole, pre svega ostalog
+      // Adaptive rate limit / auto-blackhole, before everything else
       if (rate_limited(src_ip, ts, 1)) {
         bump_stat(ST_DROP);
         bump_stat(ST_UDP_DROP);
@@ -940,9 +940,9 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         return XDP_DROP;
       }
 
-      // Proveri whitelist
+      // Check the whitelist
       __u64 * wl_ts = bpf_map_lookup_elem( & whitelist, & src_ip);
-      if (wl_ts && ts - * wl_ts < 180000000000ULL) { // 180 sekundi whitelist
+      if (wl_ts && ts - * wl_ts < 180000000000ULL) { // 180-second whitelist
         bump_stat(ST_PASS);
         bump_stat(ST_UDP_PASS);
         return XDP_ACCEPT;
@@ -951,7 +951,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       void * payload = (void * )(udp + 1);
       int legit = payload_looks_legit(payload, data_end, dport);
 
-      // Ako je ovo odgovor na challenge (drugi paket sa istim cookie-om)
+      // If this is a response to the challenge (second packet with the same cookie)
       if (data_end - payload >= 4) {
         __u32 * maybe_cookie = payload;
         struct challenge * ch = bpf_map_lookup_elem( & challenge_sent, & src_ip);
@@ -964,7 +964,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         }
       }
 
-      // Ako payload izgleda legit → pošalji challenge
+      // If the payload looks legit → send a challenge
       if (legit) {
         __u32 cookie = gen_cookie(udp -> source, ts);
         struct challenge ch = {
@@ -973,8 +973,9 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         };
         bpf_map_update_elem( & challenge_sent, & src_ip, & ch, BPF_ANY);
 
-        // Napravi challenge reply in-place: skupi paket na eth+ip+udp+4-byte
-        // cookie i pošalji ga nazad pošiljaocu (XDP_TX na isti interfejs).
+        // Build the challenge reply in-place: shrink the packet down to
+        // eth+ip+udp+4-byte cookie and send it back to the sender (XDP_TX
+        // on the same interface).
         __u8 src_mac[6], dst_mac[6];
         __builtin_memcpy(src_mac, eth -> h_source, 6);
         __builtin_memcpy(dst_mac, eth -> h_dest, 6);
@@ -1006,7 +1007,7 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         udp -> source = rdport;
         udp -> dest = sport;
         udp -> len = bpf_htons(sizeof( * udp) + 4);
-        udp -> check = 0; // dozvoljeno za IPv4 UDP
+        udp -> check = 0; // allowed for IPv4 UDP
 
         __u32 * cookie_out = (void * )(udp + 1);
         if ((void * )(cookie_out + 1) > data_end)
@@ -1044,12 +1045,13 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
       }
 #endif
 
-      // Per-IP SYN-flood protection, sve TCP portove (SSH, panel, FiveM/RedM
-      // init, itd). Samo novi handshake pokušaji (SYN bez ACK) diraju mapu —
-      // uspostavljene konekcije prolaze odmah, bez ikakvog dodatnog lookup-a
-      // ili kašnjenja. Established/data packets bump NOTHING here — that's
-      // the zero-added-latency guarantee, so ST_TCP_PASS only ever reflects
-      // SYN admissions, never the bulk established-connection volume.
+      // Per-IP SYN-flood protection, across all TCP ports (SSH, panel,
+      // FiveM/RedM init, etc). Only new handshake attempts (SYN without
+      // ACK) touch the map — established connections pass through
+      // immediately, with no extra lookup or latency. Established/data
+      // packets bump NOTHING here — that's the zero-added-latency
+      // guarantee, so ST_TCP_PASS only ever reflects SYN admissions, never
+      // the bulk established-connection volume.
       if (tcp -> syn && !tcp -> ack) {
         bump_stat(ST_TCP_SYN);
 
