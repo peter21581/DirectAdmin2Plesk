@@ -186,6 +186,33 @@ def read_whitelist(epoch):
     return out
 
 
+def read_tcp_handshake():
+    """tcp_handshake (only present if built with ENABLE_HANDSHAKE_VERIFY):
+    key=struct tcp_flow_key {u32 peer_ip; u16 peer_port; u16 local_port}
+    (8 bytes, no padding). value=struct tcp_flow_state {u8 established;
+    u64 ts} (16 bytes: 1 byte + 7 bytes compiler padding so the u64 lands
+    on an 8-byte boundary). Ports are host-byte-order (filter.c converts
+    with bpf_ntohs before storing)."""
+    out = []
+    try:
+        entries = dump_map("tcp_handshake")
+    except RuntimeError:
+        return out  # not built with ENABLE_HANDSHAKE_VERIFY — nothing to show
+    for entry in entries:
+        key = to_bytes(entry["key"])
+        val = to_bytes(entry["value"])
+        if len(key) < 8 or len(val) < 16:
+            continue
+        peer_ip_raw, peer_port, local_port = struct.unpack_from("<4sHH", key)
+        established, ts_ns = struct.unpack_from("<BxxxxxxxQ", val)
+        out.append({
+            "peer": f"{fmt_ip(peer_ip_raw)}:{peer_port}",
+            "local_port": local_port,
+            "established": bool(established),
+        })
+    return out
+
+
 def snapshot():
     now_ns = 0
     try:
@@ -196,6 +223,7 @@ def snapshot():
     epoch = boot_epoch()
     rl = read_rl_state(now_ns)
     wl = read_whitelist(epoch)
+    hs = read_tcp_handshake()
     return {
         "time": time.time(),
         "stats": read_stats(),
@@ -203,6 +231,8 @@ def snapshot():
         "blackholed": [e for e in rl if e["blackholed"]],
         "tracked_ips": len(rl),
         "whitelisted": [e for e in wl if e["trusted"]],
+        "tcp_flows": hs,
+        "tcp_flows_established": sum(1 for e in hs if e["established"]),
     }
 
 
@@ -227,6 +257,10 @@ def print_text(snap):
     for e in sorted(snap["blackholed"], key=lambda x: -x["pkt_count"])[:20]:
         print(f"    {e['ip']:<16} pkt_count={e['pkt_count']:<8} unblocks in {e['blackhole_remaining_s']:.0f}s")
     print(f"currently whitelisted (trusted) IPs: {len(snap['whitelisted'])}")
+    if snap["tcp_flows"]:
+        print(f"tracked TCP flows (ENABLE_HANDSHAKE_VERIFY): "
+              f"{len(snap['tcp_flows'])} ({snap['tcp_flows_established']} established, "
+              f"{len(snap['tcp_flows']) - snap['tcp_flows_established']} pending)")
 
 
 # --------------------------------------------------------------------- TUI
@@ -289,6 +323,10 @@ def run_tui(interval):
                 line(f"  {e['ip']:<16} pkt_count={e['pkt_count']:<8} unblocks in {e['blackhole_remaining_s']:.0f}s")
             line("")
             line(f"whitelisted (good, challenge-passed) IPs: {len(snap['whitelisted'])}")
+            if snap["tcp_flows"]:
+                line(f"tracked TCP flows: {len(snap['tcp_flows'])} "
+                     f"({snap['tcp_flows_established']} established, "
+                     f"{len(snap['tcp_flows']) - snap['tcp_flows_established']} pending)")
 
             stdscr.refresh()
             prev, prev_t = s, now
@@ -329,6 +367,12 @@ def render_prometheus(snap):
         "# HELP xdp_filter_whitelisted_ips Number of source IPs currently trusted (passed UDP challenge).",
         "# TYPE xdp_filter_whitelisted_ips gauge",
         f"xdp_filter_whitelisted_ips {len(snap['whitelisted'])}",
+        "# HELP xdp_filter_tcp_flows_tracked TCP flows tracked by ENABLE_HANDSHAKE_VERIFY (0 if not built with it).",
+        "# TYPE xdp_filter_tcp_flows_tracked gauge",
+        f"xdp_filter_tcp_flows_tracked {len(snap['tcp_flows'])}",
+        "# HELP xdp_filter_tcp_flows_established Of the tracked TCP flows, how many completed a real handshake.",
+        "# TYPE xdp_filter_tcp_flows_established gauge",
+        f"xdp_filter_tcp_flows_established {snap['tcp_flows_established']}",
     ]
     return "\n".join(lines) + "\n"
 

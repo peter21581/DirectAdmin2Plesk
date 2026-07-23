@@ -6,6 +6,7 @@
 #include <linux/tcp.h>
 #include <linux/in.h>
 #include <linux/icmp.h>
+#include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -82,6 +83,22 @@
 //                                  // idea and same scoping knobs as ENABLE_GRE:
 //                                  // -DIPIP_ALLOWED_SRC='IPV4(...)' / IPIP_ALLOWED_DST
 // #define ENABLE_AMP_PROTECTION  // DNS/NTP/memcached/SSDP/chargen/etc. reflection defense
+//
+// #define ENABLE_HANDSHAKE_VERIFY // Full TCP handshake verification — rejects any
+//                                  // non-SYN TCP packet whose flow never had a real
+//                                  // SYN/SYN-ACK observed, catching pure ACK-floods
+//                                  // that bogus_tcp_flags() alone can't see. This is a
+//                                  // genuinely different kind of feature from the rest
+//                                  // of this file — READ THE "ENABLE_HANDSHAKE_VERIFY"
+//                                  // SECTION IN FILTER.md BEFORE ENABLING IT. In short:
+//                                  // it requires a SECOND attach step (a TC egress hook,
+//                                  // not just XDP — this program can't see its own
+//                                  // replies otherwise), it adds a map lookup to every
+//                                  // established-connection packet (no longer the
+//                                  // zero-touch guarantee the rest of this file has),
+//                                  // and it drops all pre-existing connections the
+//                                  // moment it's attached (they have no tracked
+//                                  // handshake state yet).
 
 #if !defined(GAME_RUST) && !defined(GAME_FIVEM) && !defined(GAME_MINECRAFT) && \
   !defined(GAME_TS3) && !defined(GAME_ARK) && !defined(GAME_SAMP) && \
@@ -90,7 +107,8 @@
   !defined(GAME_SOURCE_ENGINE) && !defined(GAME_LEGACY_MISC_PORTS) && \
   !defined(GAME_WARZ) && !defined(GAME_TALERUNNER) && !defined(GAME_RAGNAROK) && \
   !defined(ENABLE_DNS) && !defined(ENABLE_OPENVPN) && !defined(ENABLE_WIREGUARD) && \
-  !defined(ENABLE_GRE) && !defined(ENABLE_IPIP) && !defined(ENABLE_AMP_PROTECTION)
+  !defined(ENABLE_GRE) && !defined(ENABLE_IPIP) && !defined(ENABLE_AMP_PROTECTION) && \
+  !defined(ENABLE_HANDSHAKE_VERIFY)
 #error "Define at least one GAME_*/ENABLE_* macro before compiling (see top of file) — otherwise this program only does generic TCP/ICMP/fragment protection and passes all UDP straight through."
 #endif
 
@@ -124,6 +142,7 @@
 #define RL_WINDOW_NS 1000000000ULL // 1s per-IP rate window
 #define BLACKHOLE_NS 30000000000ULL // 30s auto-blackhole once an IP exceeds its limit
 #define WHITELIST_TTL_NS 180000000000ULL // 180s trust window after passing the UDP challenge
+#define HANDSHAKE_TIMEOUT_NS 10000000000ULL // 10s to complete a TCP handshake once started
 
 struct challenge {
   __u64 timestamp;
@@ -219,6 +238,44 @@ struct {
   __uint(max_entries, 1000000);
 }
 runtime_block SEC(".maps");
+
+#ifdef ENABLE_HANDSHAKE_VERIFY
+// Shared between the ingress (xdp_anti_ddos) and egress (tcp_egress_track)
+// programs below — this is the whole reason ENABLE_HANDSHAKE_VERIFY needs a
+// second (TC egress) attach point: this program never sends a TCP SYN-ACK
+// itself (the kernel's own TCP stack does, for real listening sockets), so
+// there is no way to observe "did we really reply to this SYN" from an
+// ingress-only hook.
+//
+// Framed from the external peer's point of view regardless of who
+// initiated: peer_ip/peer_port always belong to the other side, local_port
+// always belongs to this box — so the exact same key is computed the same
+// way by both the ingress and egress programs for a given flow (ingress
+// reads it from saddr/source/dest, egress reads the same fields from
+// daddr/dest/source).
+struct tcp_flow_key {
+  __u32 peer_ip;
+  __u16 peer_port;
+  __u16 local_port;
+};
+
+// established=0 means "a handshake packet was sent, waiting for the peer's
+// next expected packet" (server side: waiting for the client's final ACK;
+// client side: waiting for the server's SYN-ACK) — not yet trusted.
+// established=1 means a real handshake actually completed.
+struct tcp_flow_state {
+  __u8 established;
+  __u64 ts; // last transition, used to time out a stuck pending handshake
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct tcp_flow_key);
+  __type(value, struct tcp_flow_state);
+  __uint(max_entries, 2000000);
+}
+tcp_handshake SEC(".maps");
+#endif
 
 // Defense mode: 0=normal 1=elevated 2=critical.
 // Written by an external controller (userspace daemon reading `stats`,
@@ -697,9 +754,14 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
   if (dport >= 27000 && dport <= 27500) return data + 4 <= data_end && * (__u32 * ) data == 0xffffffff;
 #endif
 #ifdef GAME_RUST
-  // RakNet ID_OPEN_CONNECTION_REQUEST_1 + start of offline-message magic —
-  // exact 4-byte signature validated in production, not just the first byte.
-  if (dport == 28015) return data + 4 <= data_end && * (__u32 * ) data == 0xffff0005; // 05 00 FF FF, little-endian read
+  // Rust accepts two query mechanisms: RakNet's ID_OPEN_CONNECTION_REQUEST_1
+  // + start of offline-message magic (exact 4-byte signature validated in
+  // production), and a bare Source-engine-style query prefix (also
+  // explicitly allowed in production, alongside the RakNet path).
+  if (dport == 28015)
+    return data + 4 <= data_end &&
+    ( * (__u32 * ) data == 0xffff0005 || // 05 00 FF FF, little-endian read
+      * (__u32 * ) data == 0xffffffff);
 #endif
 #ifdef GAME_MINECRAFT
   // Bedrock (RakNet unconnected ping, dedicated port — strict gate)
@@ -729,10 +791,15 @@ static inline int payload_looks_legit(void * data, void * data_end, __u16 dport)
 
 #ifdef GAME_SAMP
   // San Andreas Multiplayer query, shares default port 7777 with the block
-  // above — magic "SAMP" prefix.
+  // above — magic "SAMP" prefix, or an alternate 2-byte magic also seen in
+  // production. A TS3INIT-shaped payload arriving on a SAMP port is a
+  // cross-protocol-confusion tell (a real SAMP client never sends that) —
+  // reject outright rather than falling through to the permissive default
+  // at the end of this function.
   if (dport == 7777) {
-    if (data + 4 <= data_end && bpf_strncmp(data, 4, "SAMP") == 0)
-      return 1;
+    if (data + 4 <= data_end && * (__u32 * ) data == 0x49335354) return 0; // "TS3I"
+    if (data + 4 <= data_end && bpf_strncmp(data, 4, "SAMP") == 0) return 1;
+    if (data + 2 <= data_end && * (__u16 * ) data == 0x1e08) return 1;
   }
 #endif
 
@@ -953,6 +1020,19 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         return XDP_DROP;
       }
 
+#ifdef GAME_FIVEM
+      // A packet claiming both source and destination port 30120 (FiveM's
+      // default port) is a validated production reflection/loop signature,
+      // not real client traffic — a real client's ephemeral source port
+      // never matches the server's own game port.
+      if (sport == 30120 && dport == 30120) {
+        bump_stat(ST_DROP);
+        bump_stat(ST_UDP_DROP);
+        bump_stat(ST_REFLECT_DROP);
+        return XDP_DROP;
+      }
+#endif
+
       __u32 src_ip = ip -> saddr;
       __u64 ts = bpf_ktime_get_ns();
 
@@ -1059,6 +1139,55 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
         return XDP_DROP;
       }
 
+#ifdef ENABLE_HANDSHAKE_VERIFY
+      // Full handshake verification — see the ENABLE_HANDSHAKE_VERIFY
+      // comment at the top of this file and the matching section in
+      // FILTER.md before enabling this. Framed from the peer's point of
+      // view (see struct tcp_flow_key's comment): on ingress, the peer is
+      // always whoever sent us this packet.
+      {
+        struct tcp_flow_key hs_key = {
+          .peer_ip = ip -> saddr,
+          .peer_port = bpf_ntohs(tcp -> source),
+          .local_port = bpf_ntohs(tcp -> dest)
+        };
+
+        if (tcp -> fin || tcp -> rst) {
+          // Connection closing — stop tracking it either way, whether it
+          // was ever established or not.
+          bpf_map_delete_elem( & tcp_handshake, & hs_key);
+        } else if (tcp -> syn && !tcp -> ack) {
+          // New inbound connection attempt (we'd be the server). No state
+          // to check yet — state gets created on OUR egress SYN-ACK reply
+          // (tcp_egress_track below), once the kernel actually decides to
+          // answer it. Falls through to the existing SYN-flood protection.
+        } else {
+          // Either a SYN-ACK arriving inbound (we'd be the client — this
+          // is a reply to our own outbound SYN) or a non-SYN packet
+          // (established data, or the client's final handshake ACK
+          // completing a connection we're the server for).
+          struct tcp_flow_state * hs = bpf_map_lookup_elem( & tcp_handshake, & hs_key);
+          __u64 hs_now = bpf_ktime_get_ns();
+          if (hs && (hs -> established || hs_now - hs -> ts < HANDSHAKE_TIMEOUT_NS)) {
+            if (!hs -> established) {
+              hs -> established = 1;
+              hs -> ts = hs_now;
+            }
+          } else {
+            // No matching handshake ever observed for this flow (or it
+            // timed out) — this is exactly the pure-ACK-flood / unsolicited
+            // SYN-ACK shape GXP_TCP_STATELESS was built to catch. Reject
+            // outright rather than silently letting it through the way an
+            // ingress-only filter otherwise would have to.
+            bump_stat(ST_DROP);
+            bump_stat(ST_TCP_DROP);
+            bump_stat(ST_UNVERIFIED_DROP);
+            return XDP_DROP;
+          }
+        }
+      }
+#endif
+
 #ifdef GAME_RAN
       void * tcp_payload = (void * ) tcp + (tcp -> doff * 4); // account for TCP options
       if (is_known_bad_tcp_payload(tcp_payload, data_end)) {
@@ -1070,17 +1199,34 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 #endif
 
 #ifdef GAME_FIVEM
-      // Only established connections on FiveM's TCP port range can carry
-      // an HTTP request at all — skip entirely for SYN/SYN+ACK, and for
-      // any other TCP port on this box.
       __u16 fivem_dport = bpf_ntohs(tcp -> dest);
-      if (!tcp -> syn && fivem_dport >= 30000 && fivem_dport <= 32000) {
-        void * http_payload = (void * ) tcp + (tcp -> doff * 4); // account for TCP options
-        if (is_players_json_request(http_payload, data_end)) {
-          bump_stat(ST_DROP);
-          bump_stat(ST_TCP_DROP);
-          bump_stat(ST_LEAK_DROP);
-          return XDP_DROP;
+      if (fivem_dport >= 30000 && fivem_dport <= 32000) {
+        if (tcp -> syn && !tcp -> ack) {
+          // FiveM's real client flow is UDP first (getinfo/connect, gated
+          // by the challenge/response system above) — the TCP connection
+          // (HTTP/NUI/asset streaming) only ever follows after that
+          // succeeds. Reject the TCP handshake outright from a source
+          // that hasn't recently passed the UDP challenge — matches the
+          // original production config's _fxconn gate for this exact port
+          // range, just backed by our own (spoof-resistant) whitelist.
+          __u32 fivem_src = ip -> saddr;
+          __u64 * fivem_wl = bpf_map_lookup_elem( & whitelist, & fivem_src);
+          __u64 fivem_now = bpf_ktime_get_ns();
+          if (!fivem_wl || fivem_now - * fivem_wl >= WHITELIST_TTL_NS) {
+            bump_stat(ST_DROP);
+            bump_stat(ST_TCP_DROP);
+            bump_stat(ST_UNVERIFIED_DROP);
+            return XDP_DROP;
+          }
+        } else if (!tcp -> syn) {
+          // Only established connections can carry an HTTP request at all.
+          void * http_payload = (void * ) tcp + (tcp -> doff * 4); // account for TCP options
+          if (is_players_json_request(http_payload, data_end)) {
+            bump_stat(ST_DROP);
+            bump_stat(ST_TCP_DROP);
+            bump_stat(ST_LEAK_DROP);
+            return XDP_DROP;
+          }
         }
       }
 #endif
@@ -1234,5 +1380,58 @@ int xdp_anti_ddos(struct xdp_md * ctx) {
 
   return XDP_ACCEPT;
 }
+
+#ifdef ENABLE_HANDSHAKE_VERIFY
+// Egress half of full handshake verification (see the top-of-file
+// ENABLE_HANDSHAKE_VERIFY comment and FILTER.md). Attached as a separate TC
+// egress hook — NOT loaded/attached the same way as xdp_anti_ddos above; see
+// FILTER.md for the second attach command this requires. Only records
+// state; never itself blocks anything (an operator's own outbound traffic
+// should never be dropped by this program).
+SEC("tc")
+int tcp_egress_track(struct __sk_buff * skb) {
+  void * data = (void * )(long) skb -> data;
+  void * data_end = (void * )(long) skb -> data_end;
+
+  struct ethhdr * eth = data;
+  if (data + sizeof( * eth) > data_end) return TC_ACT_OK;
+  if (eth -> h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
+
+  struct iphdr * ip = data + sizeof( * eth);
+  if ((void * ) & ip[1] > data_end) return TC_ACT_OK;
+  if (ip -> protocol != IPPROTO_TCP) return TC_ACT_OK;
+  if (ip -> ihl < 5) return TC_ACT_OK;
+
+  struct tcphdr * tcp = (void * ) ip + (ip -> ihl * 4);
+  if ((void * )(tcp + 1) > data_end) return TC_ACT_OK;
+
+  // Same key shape as the ingress side, but read from the egress fields:
+  // the peer is whoever we're sending this packet to.
+  struct tcp_flow_key key = {
+    .peer_ip = ip -> daddr,
+    .peer_port = bpf_ntohs(tcp -> dest),
+    .local_port = bpf_ntohs(tcp -> source)
+  };
+
+  if (tcp -> fin || tcp -> rst) {
+    bpf_map_delete_elem( & tcp_handshake, & key);
+    return TC_ACT_OK;
+  }
+
+  // Only a SYN (we're initiating, as a client) or a SYN-ACK (the kernel's
+  // own reply, as a server, to a SYN we let through on ingress) starts a
+  // new pending handshake. Anything else egressing is either data on an
+  // already-tracked flow (nothing to do) or irrelevant.
+  if (tcp -> syn) {
+    struct tcp_flow_state st = {
+      .established = 0,
+      .ts = bpf_ktime_get_ns()
+    };
+    bpf_map_update_elem( & tcp_handshake, & key, & st, BPF_ANY);
+  }
+
+  return TC_ACT_OK;
+}
+#endif
 
 char _license[] SEC("license") = "GPL";

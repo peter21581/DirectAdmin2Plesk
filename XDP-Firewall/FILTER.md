@@ -58,6 +58,7 @@ it) — read it before running with root, same as any installer script.
 - `clang`/LLVM with BPF target support
 - `libbpf` headers (`bpf/bpf_helpers.h`, `bpf/bpf_endian.h`)
 - `bpftool` (for loading, inspecting maps, detaching)
+- `iproute2` (`ip` for XDP attach; `tc` for the optional `ENABLE_HANDSHAKE_VERIFY` egress hook)
 - `python3` and `curl` (for `monitor.py`/`xdpctl.py`)
 - A NIC/driver that supports native XDP for best performance (falls back to
   generic/SKB-mode XDP automatically if not — still works, just slower)
@@ -70,12 +71,12 @@ source untouched and makes the build reproducible):
 
 | Flag | Covers |
 |---|---|
-| `GAME_RUST` | Rust (RakNet, UDP 28015) |
-| `GAME_FIVEM` | FiveM / RedM (UDP+TCP 30000-32000). Also blocks the `/players.json` HTTP endpoint on established TCP connections in that range — a known FiveM privacy leak that exposes every connected player's real IP address, unrelated to DDoS |
+| `GAME_RUST` | Rust (RakNet, UDP 28015) — accepts either the RakNet handshake magic or a bare Source-engine-style query prefix, both validated in production |
+| `GAME_FIVEM` | FiveM / RedM (UDP+TCP 30000-32000). Blocks `/players.json` on established TCP connections (a known FiveM privacy leak exposing every connected player's real IP). Drops UDP with source port *and* destination port both 30120 (a validated reflection/loop signature). TCP connections in this range require the source to have already passed the UDP challenge (`whitelist`) — matches the real client flow (UDP handshake first, then TCP for HTTP/NUI/assets) and the original config's `_fxconn` gate |
 | `GAME_MINECRAFT` | Bedrock (UDP 19132) + Java/GS4 query (UDP 25565-25575) + an extra UDP/TCP backend range (19000-20000, e.g. BungeeCord/Velocity proxy backends) |
 | `GAME_TS3` | TeamSpeak 3 (UDP 9000-10500). Also gates the TCP file-transfer port (30033, avatars/icons/channel files): a SYN there is rejected unless the source already passed the UDP voice challenge (same `whitelist` trust window) — a real client never opens it first |
 | `GAME_ARK` | ARK: Survival Evolved (high/dynamic query ports) |
-| `GAME_SAMP` | San Andreas Multiplayer (UDP 7777) |
+| `GAME_SAMP` | San Andreas Multiplayer (UDP 7777) — accepts the `"SAMP"` prefix or an alternate 2-byte magic also seen in production; explicitly rejects a TS3INIT-shaped payload on this port (cross-protocol-confusion signal, not something a real SAMP client ever sends) |
 | `GAME_SQUAD` | Squad (UDP 7787, 21114, 27165, 7000-8999) |
 | `GAME_MORDHAU` | Mordhau (UDP 7000-8999, 15000, 27015) |
 | `GAME_HLL` | Hell Let Loose (UDP 8778, 27015, 7000-8999) |
@@ -93,6 +94,7 @@ source untouched and makes the build reproducible):
 | `ENABLE_GRE` | This box terminates a GRE tunnel (e.g. PPTP) — exempts GRE from the other-protocol rate limiter below, scoped to the real tunnel peer via `GRE_ALLOWED_SRC`/`GRE_ALLOWED_DST` (see below). Leave undefined to have GRE rate-limited like any other non-UDP/TCP/ICMP protocol |
 | `ENABLE_IPIP` | Same idea as `ENABLE_GRE`, for IP-in-IP tunnels (protocol 4) — scoped via `IPIP_ALLOWED_SRC`/`IPIP_ALLOWED_DST` the same way |
 | `ENABLE_AMP_PROTECTION` | UDP reflection/amplification defense — DNS, NTP, memcached, SSDP, chargen, CLDAP, SNMP, portmap |
+| `ENABLE_HANDSHAKE_VERIFY` | Full TCP handshake verification (catches pure ACK-floods). **Read its own section below before enabling** — needs a second attach step, changes the performance profile, and drops all pre-existing connections the moment it's attached |
 
 Anything not defined compiles out completely — no extra branches, no extra
 verifier work, zero runtime cost.
@@ -305,6 +307,93 @@ outbound queries this box sends, so "allowing DNS out" to these resolvers
 was never something this filter could block in the first place; only the
 inbound-answer side needed the exemption above.
 
+## `ENABLE_HANDSHAKE_VERIFY` — full TCP handshake verification
+
+Off by default. Every other TCP protection in this file (`bogus_tcp_flags`,
+SYN-flood limiting, subnet limiting, the SYN-length check) only ever looks
+at the SYN — established/data packets pass through completely untouched,
+which has been a hard requirement throughout this whole file (zero added
+latency for the bulk of TCP traffic). That leaves one real gap: a **pure
+ACK-flood** — a packet that just claims to belong to an established
+connection, when no handshake for it ever actually happened — looks
+completely valid to every check above and sails through.
+
+Closing that gap means actually verifying a real SYN → SYN-ACK → ACK
+handshake occurred, which needs to see this box's own **outbound** SYN-ACK
+replies. This program's `xdp_anti_ddos` only hooks **ingress** — an XDP
+program attached that way architecturally cannot observe egress traffic.
+So this feature is two programs sharing one map:
+
+- `xdp_anti_ddos` (ingress, XDP, as always) — now also enforces: any
+  non-SYN TCP packet for a flow with no tracked handshake state (or a
+  timed-out one) gets dropped.
+- `tcp_egress_track` (egress, **TC**, new) — watches this box's own
+  outbound TCP: a SYN (this box initiating a connection, as a client) or a
+  SYN-ACK (the kernel's own reply, as a server, to a SYN this box already
+  let through on ingress) marks that flow's handshake as started. It never
+  drops anything itself — only records state.
+
+Both directions are tracked (this box as server *and* as client), so this
+does **not** break the box's own outbound connections (SSH out, license
+checks, updates, whatever else it initiates) — only unsolicited traffic
+with no real handshake behind it gets rejected.
+
+### Building and attaching
+
+The `tc` program is in the same `filter.c` / `filter.o` — one build, two
+attach commands:
+
+```bash
+clang -target bpf -O2 -DGAME_RUST -DENABLE_HANDSHAKE_VERIFY -c filter.c -o filter.o
+
+# 1. XDP ingress, same as always:
+sudo ip link set dev <iface> xdp obj filter.o sec xdp
+
+# 2. TC egress — needs a clsact qdisc first, then attach the program:
+sudo tc qdisc add dev <iface> clsact
+sudo tc filter add dev <iface> egress bpf da obj filter.o sec tc
+```
+
+Verify both attached:
+
+```bash
+ip link show dev <iface>              # look for "prog/xdp id <N>"
+tc filter show dev <iface> egress     # look for the bpf filter entry
+```
+
+Detach both when replacing/removing:
+
+```bash
+sudo ip link set dev <iface> xdp off
+sudo tc qdisc del dev <iface> clsact   # also removes the egress filter
+```
+
+### What this actually costs you — read before enabling
+
+- **No longer zero-touch for established connections.** Every established
+  TCP packet now costs one map lookup (checking/updating handshake state),
+  not zero. This is inherent to what "verify a real handshake happened"
+  means — it's exactly how every real stateful firewall's conntrack table
+  works, iptables included. A single bounded LRU-hash lookup is fast (same
+  cost-class as the per-IP rate-limit lookup SYNs already pay), but it's a
+  real, deliberate departure from this file's usual "established traffic
+  pays nothing" design.
+- **Drops all pre-existing connections the moment you attach it.** Any TCP
+  connection that was already open before this program loaded has no
+  tracked handshake state (its SYN/SYN-ACK happened before the egress
+  program was watching), so its next packet gets rejected as unverified.
+  Attach both hooks before real traffic starts, or expect a brief
+  connection reset for whatever was already connected when you (re)attach.
+- **10-second handshake completion window** (`HANDSHAKE_TIMEOUT_NS`, not
+  currently exposed as a `-D` override — edit the constant directly if you
+  need a different value). A connection whose final ACK is delayed past
+  that (e.g. a genuinely very lossy path) gets rejected as timed out, same
+  as one that never had a real handshake. Generous for normal internet
+  conditions, but worth knowing.
+- Requires `tc` (part of `iproute2`, already a dependency for everything
+  else here) and a NIC/driver that supports a clsact qdisc — universally
+  available on any real Linux NIC, no special hardware offload needed.
+
 ## Monitoring
 
 Two ways to look at what the filter is doing: raw `bpftool` for one-off
@@ -334,7 +423,7 @@ of `filter.c`) — it's per-CPU, so sum across CPUs for the total:
 | 25 | `ST_BADPAYLOAD_DROP` | known-bad UDP payload signature (flood-tool fingerprints) |
 | 26 | `ST_MALFORMED_DROP` | protocol header claims an impossible size (e.g. UDP length field < 8) |
 | 27 | `ST_LEAK_DROP` | blocked a data-leak-prone request (FiveM `/players.json`) |
-| 28 | `ST_UNVERIFIED_DROP` | rejected: source hasn't passed a required prior verification step (TS3 file-transfer port) |
+| 28 | `ST_UNVERIFIED_DROP` | rejected: source hasn't passed a required prior verification step (TS3 file-transfer port, FiveM's TCP gate, or — with `ENABLE_HANDSHAKE_VERIFY` — any TCP flow with no real tracked handshake) |
 
 ```bash
 sudo bpftool map dump name stats
@@ -373,9 +462,11 @@ python3 monitor.py --serve 0.0.0.0:9107     # Prometheus /metrics for Grafana
 It shows: pass/drop totals and per-protocol breakdown with live rates,
 the drop-reason breakdown table above, current defense mode, the list of
 currently **blackholed ("bad") IPs** (from `rl_state`, sorted by packet
-count, with time until unblock) and the count of currently **whitelisted
+count, with time until unblock), the count of currently **whitelisted
 ("good") IPs** (from `whitelist` — challenge-passed, still within the
-180-second trust window).
+180-second trust window), and — if built with `ENABLE_HANDSHAKE_VERIFY` —
+the count of tracked TCP flows split into established vs. still-pending a
+handshake (from `tcp_handshake`; shows nothing if that map doesn't exist).
 
 Caveat: `monitor.py` was written and logic-tested against synthetic fixture
 data (no Linux/eBPF environment was available to test it against real
@@ -484,24 +575,19 @@ sudo bpftool map update name defense_mode key 0 0 0 0 value 1 0 0 0
   to be worth the added complexity here); and a SAMP-specific fixed UDP
   checksum fingerprint, which was too implementation-specific to that
   game's exact wire format to confidently decode from the rule alone.
-- **Pure ACK-floods (no real handshake ever happened) aren't caught.**
-  `bogus_tcp_flags()` only rejects structurally invalid flag combinations —
-  a plain ACK packet claiming to belong to an established connection looks
-  completely valid to it. The source config's `GXP_TCP_STATELESS` chain
-  catches this class of attack by tracking whether a real SYN → SYN-ACK →
-  ACK handshake was actually observed. That's not portable here: proving a
-  handshake completed requires seeing the box's own **outbound** SYN-ACK,
-  and this program only hooks **ingress** — an XDP program attached this
-  way architecturally cannot see egress traffic. Doing this properly would
-  need a second hook (TC egress) tracking outbound SYN-ACKs, which is a
-  real architecture change, not something to bolt on quietly.
+- **Pure ACK-floods are now caught, but only if you enable
+  `ENABLE_HANDSHAKE_VERIFY`** (off by default) — see its own section below.
+  It's a genuinely bigger architecture change than everything else in this
+  file (a second attach hook, a map lookup on every established packet), so
+  it's opt-in rather than always-on like `bogus_tcp_flags()`.
 - The source config's `GXP_TCPTHENUDP` pattern (require a successful TCP
-  handshake from an IP before trusting its UDP traffic — spoof-resistant
-  because completing a TCP handshake proves the source can actually receive
-  traffic) was reviewed and not implemented as a general mechanism. None of
-  the currently-supported games need it specifically, and the UDP
-  challenge/response system already in this file achieves a comparable
-  guarantee for the games that do need spoof resistance.
+  handshake from an IP before trusting its UDP traffic) was reviewed and
+  not implemented as a general mechanism — no currently-supported game
+  needs TCP-gates-UDP specifically, and the UDP challenge/response system
+  already achieves comparable spoof resistance for the games that do need
+  it. The *reverse* pattern (UDP-gates-TCP) is implemented for the two
+  games that actually need it: `GAME_TS3`'s file-transfer port and
+  `GAME_FIVEM`'s TCP port range, both gated on the `whitelist` map.
 - Minecraft's extra backend range intentionally covers 19000-20000 but
   **not** the 49152-65535 range also present in the source config for
   "custom" Minecraft deployments — that's most of the OS ephemeral port
