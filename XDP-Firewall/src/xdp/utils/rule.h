@@ -7,6 +7,7 @@
 #include <xdp/utils/maps.h>
 
 #include <xdp/utils/games.h>
+#include <xdp/utils/challenge.h>
 
 #include <linux/ip.h>
 #include <linux/ipv6.h>

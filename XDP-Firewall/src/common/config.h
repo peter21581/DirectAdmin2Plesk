@@ -97,3 +97,38 @@
 // resolvers (Google, Cloudflare, Quad9, AdGuard) are exempted from the
 // size-based DNS/NTP checks since their legitimate replies can be large.
 #define ENABLE_AMP_PROTECTION
+
+// Generic anti-spoofing checks, always on regardless of the `filters` list:
+// drops UDP packets with a privileged (<1024) source port other than 53
+// (a real client's ephemeral source port is never privileged -- this shape
+// only occurs in reflected/spoofed floods), and drops invalid TCP flag
+// combinations (null/Xmas/nmap-style scans -- no real stack sends these).
+#define ENABLE_ANTI_SPOOF
+
+// Per-source-IP ICMP flood protection, always on regardless of the
+// `filters` list: a 1-second rolling packet budget (weighted -- echo
+// requests, common/expected, cost less of the budget than other, rarer,
+// more-often-abusive ICMP types). Independent of ENABLE_RL_IP/
+// ENABLE_RL_FLOW, which only apply to rules that explicitly set
+// ip_pps/flow_pps.
+#define ENABLE_ICMP_PROTECTION
+#ifndef ICMP_PPS_LIMIT
+#define ICMP_PPS_LIMIT 200 // packets/sec budget before a source's ICMP gets dropped
+#endif
+
+// The spoof-resistant UDP challenge/response system: for a filter rule
+// whose game profile has needs_challenge (see common/games.h), a source
+// isn't trusted on its first handshake-shaped packet alone -- that packet
+// is dropped and the source remembered; a second one arriving within a
+// plausible real-client retry window (see xdp/utils/challenge.h) proves
+// the source can complete a round trip and gets it whitelisted (see
+// UDP_CHALLENGE_TTL below). No crafted reply packet is sent -- see
+// README.md's "Spoof-resistant challenge/response" section for why this
+// design was chosen over an active cookie-echo challenge. No separate
+// opt-in needed beyond setting `game` on a rule to one of the games this
+// applies to -- undefine this to disable it globally (e.g. if you'd rather
+// trust the payload signature alone).
+#define ENABLE_UDP_CHALLENGE
+#ifndef UDP_CHALLENGE_TTL
+#define UDP_CHALLENGE_TTL 180 // seconds a source stays trusted after passing the challenge
+#endif

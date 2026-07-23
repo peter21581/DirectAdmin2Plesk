@@ -17,6 +17,8 @@
 #include <xdp/utils/bogon.h>
 #include <xdp/utils/payload.h>
 #include <xdp/utils/amp.h>
+#include <xdp/utils/antispoof.h>
+#include <xdp/utils/icmp_protect.h>
 
 #include <xdp/utils/maps.h>
 
@@ -174,11 +176,11 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 #endif
 
-#ifdef ENABLE_FILTERS
-    // Retrieve total packet length.
-    u16 pkt_len = data_end - data;
-
-    // Parse layer-4 headers and determine source port and protocol.
+    // Parse layer-4 headers and determine source port and protocol. This
+    // always runs regardless of ENABLE_FILTERS -- anti-spoof/bad-payload/
+    // amplification/ICMP protection are always-on core checks (see below),
+    // not something that should disappear just because dynamic filter
+    // rules are compiled out for a minimal block-map-only build.
     struct tcphdr *tcph = NULL;
     struct udphdr *udph = NULL;
     struct icmphdr *icmph = NULL;
@@ -224,6 +226,15 @@ int xdp_prog_main(struct xdp_md *ctx)
 
                 payload = (void *)tcph + (tcph->doff * 4);
 
+#ifdef ENABLE_ANTI_SPOOF
+                if (bogus_tcp_flags(tcph))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+#endif
+
                 break;
 
             case IPPROTO_UDP:
@@ -245,6 +256,15 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 
                 payload = (void *)(udph + 1);
+
+#ifdef ENABLE_ANTI_SPOOF
+                if (is_reflected_udp_source(ntohs(udph->source)))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+#endif
 
 #ifdef ENABLE_BAD_PAYLOAD_FILTER
                 if (is_ascii_garbage_flood(payload, data_end) || is_known_bad_udp_payload(payload, data_end))
@@ -278,6 +298,15 @@ int xdp_prog_main(struct xdp_md *ctx)
                     return XDP_DROP;
                 }
 
+#ifdef ENABLE_ICMP_PROTECTION
+                if (icmp_rate_limited_v4(iph->saddr, icmp_weight_v4(icmph), now))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+#endif
+
                 break;
         }
     }
@@ -308,6 +337,15 @@ int xdp_prog_main(struct xdp_md *ctx)
 
                 payload = (void *)tcph + (tcph->doff * 4);
 
+#ifdef ENABLE_ANTI_SPOOF
+                if (bogus_tcp_flags(tcph))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+#endif
+
                 break;
 
             case IPPROTO_UDP:
@@ -329,6 +367,15 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 
                 payload = (void *)(udph + 1);
+
+#ifdef ENABLE_ANTI_SPOOF
+                if (is_reflected_udp_source(ntohs(udph->source)))
+                {
+                    inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                    return XDP_DROP;
+                }
+#endif
 
 #ifdef ENABLE_BAD_PAYLOAD_FILTER
                 if (is_ascii_garbage_flood(payload, data_end) || is_known_bad_udp_payload(payload, data_end))
@@ -362,12 +409,29 @@ int xdp_prog_main(struct xdp_md *ctx)
                     return XDP_DROP;
                 }
 
+#ifdef ENABLE_ICMP_PROTECTION
+                {
+                    u128 icmp_src_ip6;
+                    memcpy(&icmp_src_ip6, iph6->saddr.in6_u.u6_addr32, sizeof(icmp_src_ip6));
+
+                    if (icmp_rate_limited_v6(icmp_src_ip6, icmp_weight_v6(icmp6h), now))
+                    {
+                        inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                        return XDP_DROP;
+                    }
+                }
+#endif
+
                 break;
         }
     }
 #endif
 
 #ifdef ENABLE_FILTERS
+    // Retrieve total packet length.
+    u16 pkt_len = data_end - data;
+
     // Update client stats (PPS/BPS).
     u64 ip_pps = 0;
     u64 ip_bps = 0;
@@ -397,7 +461,6 @@ int xdp_prog_main(struct xdp_md *ctx)
         update_flow6_stats(&flow_pps, &flow_bps, &src_ip6, src_port, protocol, pkt_len, now);
 #endif
     }
-#endif
 #endif
 #endif
 

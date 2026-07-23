@@ -119,6 +119,8 @@ static __always_inline int payload_matches_game(u8 game_id, void *payload, void 
         case GAME_RUST:
         case GAME_FIVEM:
         case GAME_MINECRAFT_BE:
+        case GAME_UNTURNED:
+        case GAME_WARZ:
             return payload_is_raknet(payload, data_end);
 
         case GAME_SOURCE_ENGINE:

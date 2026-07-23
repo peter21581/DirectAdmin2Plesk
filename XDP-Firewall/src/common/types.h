@@ -117,6 +117,14 @@ struct filter
     unsigned int do_game : 1;
     u8 game_id;
 
+    // Set automatically (see loader/utils/xdp.c's update_filter()) for
+    // games whose GAME_PROFILES entry has needs_challenge -- gates this
+    // rule's UDP traffic behind the spoof-resistant challenge/response
+    // system (xdp/utils/challenge.h) instead of trusting the source
+    // address outright. Never applied to TCP traffic -- a real 3-way
+    // handshake already provides that resistance.
+    unsigned int do_challenge : 1;
+
 #ifdef ENABLE_RL_IP
     unsigned int do_ip_pps : 1;
     u64 ip_pps;
@@ -153,6 +161,15 @@ struct cl_stats
     u64 bps;
     u64 next_update;
 } typedef cl_stats_t;
+
+// Per-source-IP ICMP flood counter (see xdp/utils/icmp_protect.h). Separate
+// from cl_stats_t since ICMP protection is always-on regardless of whether
+// ENABLE_RL_IP/ENABLE_RL_FLOW filter-rule rate limiting is compiled in.
+struct icmp_state
+{
+    u64 window_start;
+    u32 pkt_count;
+} typedef icmp_state_t;
 
 struct flow
 {

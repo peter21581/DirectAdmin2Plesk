@@ -12,15 +12,26 @@ filters = (
         action = 1
     },
 
-    // Example: only let UDP 28015 through if the payload actually looks
-    // like a real Rust/RakNet packet, not just a flood aimed at the port.
-    // See README.md's "game" filter option -- other supported values are
-    // fivem, source_engine, minecraft_be, samp, ts3.
+    // Example: `game` alone auto-fills the protocol/port from Rust's
+    // profile (UDP 28015) and only lets the packet through if its payload
+    // actually looks like a real RakNet handshake -- not just anything
+    // aimed at the port. Games with a well-understood handshake (like
+    // this one) also get the spoof-resistant UDP challenge/response
+    // system automatically. See README.md's "The `game` filter option"
+    // for the full list of supported games and their default ports.
     // {
     //     enabled = true,
     //     action = 1,
-    //     udp_enabled = true,
-    //     udp_dport = 28015,
+    //     game = "rust"
+    // }
+
+    // Override the default port if your server doesn't use the
+    // conventional one -- any field you set explicitly always wins over
+    // the game's profile default.
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     udp_dport = 28016,
     //     game = "rust"
     // }
 );

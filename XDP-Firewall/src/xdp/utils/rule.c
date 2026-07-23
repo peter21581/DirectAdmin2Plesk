@@ -304,6 +304,46 @@ static __always_inline long process_rule(u32 idx, void* data)
         return 0;
     }
 
+#ifdef ENABLE_UDP_CHALLENGE
+    // Spoof-resistant challenge tracking (see xdp/utils/challenge.h) --
+    // only for UDP game rules whose profile calls for it (do_challenge),
+    // and only when this rule would otherwise allow the packet through (a
+    // `game` rule with action=0 is already dropping it, nothing to add).
+    if (filter->do_game && filter->do_challenge && filter->action == 1 && ctx->udph)
+    {
+        u64 now = bpf_ktime_get_ns();
+        int trusted = 0;
+
+        if (ctx->iph)
+        {
+            u32 ip = ctx->iph->saddr;
+
+            trusted = challenge_is_whitelisted_v4(ip, now) || challenge_track_v4(ip, now);
+        }
+#ifdef ENABLE_IPV6
+        else if (ctx->iph6)
+        {
+            u128 ip6;
+            memcpy(&ip6, ctx->iph6->saddr.in6_u.u6_addr32, sizeof(ip6));
+
+            trusted = challenge_is_whitelisted_v6(ip6, now) || challenge_track_v6(ip6, now);
+        }
+#endif
+
+        if (!trusted)
+        {
+            // Not yet proven real -- drop this one packet only (no
+            // block_time: being unwhitelisted isn't itself malicious, just
+            // unproven -- a real client's natural retry gets a fair shot).
+            ctx->matched = 1;
+            ctx->action = 0;
+            ctx->block_time = 0;
+
+            return 1;
+        }
+    }
+#endif
+
 #ifdef ENABLE_FILTER_LOGGING
     if (filter->log > 0)
     {

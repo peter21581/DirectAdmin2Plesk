@@ -217,6 +217,10 @@ int game_id_from_name(const char* name)
     {
         return GAME_MINECRAFT_BE;
     }
+    else if (strcasecmp(name, "minecraft_java") == 0)
+    {
+        return GAME_MINECRAFT_JAVA;
+    }
     else if (strcasecmp(name, "samp") == 0)
     {
         return GAME_SAMP;
@@ -224,6 +228,38 @@ int game_id_from_name(const char* name)
     else if (strcasecmp(name, "ts3") == 0)
     {
         return GAME_TS3;
+    }
+    else if (strcasecmp(name, "ark") == 0)
+    {
+        return GAME_ARK;
+    }
+    else if (strcasecmp(name, "squad") == 0)
+    {
+        return GAME_SQUAD;
+    }
+    else if (strcasecmp(name, "mordhau") == 0)
+    {
+        return GAME_MORDHAU;
+    }
+    else if (strcasecmp(name, "hll") == 0)
+    {
+        return GAME_HLL;
+    }
+    else if (strcasecmp(name, "unturned") == 0)
+    {
+        return GAME_UNTURNED;
+    }
+    else if (strcasecmp(name, "altv") == 0)
+    {
+        return GAME_ALTV;
+    }
+    else if (strcasecmp(name, "ragnarok") == 0)
+    {
+        return GAME_RAGNAROK;
+    }
+    else if (strcasecmp(name, "warz") == 0)
+    {
+        return GAME_WARZ;
     }
 
     return GAME_NONE;
@@ -252,11 +288,38 @@ const char* game_name_from_id(int id)
         case GAME_MINECRAFT_BE:
             return "minecraft_be";
 
+        case GAME_MINECRAFT_JAVA:
+            return "minecraft_java";
+
         case GAME_SAMP:
             return "samp";
 
         case GAME_TS3:
             return "ts3";
+
+        case GAME_ARK:
+            return "ark";
+
+        case GAME_SQUAD:
+            return "squad";
+
+        case GAME_MORDHAU:
+            return "mordhau";
+
+        case GAME_HLL:
+            return "hll";
+
+        case GAME_UNTURNED:
+            return "unturned";
+
+        case GAME_ALTV:
+            return "altv";
+
+        case GAME_RAGNAROK:
+            return "ragnarok";
+
+        case GAME_WARZ:
+            return "warz";
     }
 
     return "N/A";

@@ -261,14 +261,31 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
         filter.block_time = filter_cfg->block_time;
     }
 
+    // Resolved once here and reused below (in the tcp/udp enabled+port
+    // blocks) to auto-fill protocol/port -- a bare `game = "x"` with no
+    // udp_enabled/tcp_enabled/ports set gets the game's conventional
+    // default protocol+port; the payload signature check itself (see
+    // xdp/utils/games.h) and the challenge/response eligibility (see
+    // xdp/utils/challenge.h) always apply regardless of where the
+    // port/protocol came from.
+    int game_id = GAME_NONE;
+    const game_profile_t* game_profile = NULL;
+
     if (filter_cfg->game)
     {
-        int game_id = game_id_from_name(filter_cfg->game);
+        game_id = game_id_from_name(filter_cfg->game);
 
         if (game_id != GAME_NONE)
         {
             filter.do_game = 1;
             filter.game_id = (u8)game_id;
+
+            game_profile = &GAME_PROFILES[game_id];
+
+            if (game_profile->needs_challenge)
+            {
+                filter.do_challenge = 1;
+            }
         }
     }
 
@@ -375,9 +392,19 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
         filter.ip.tos = filter_cfg->ip.tos;
     }
 
-    if (filter_cfg->tcp.enabled > -1)
+    // Auto-fill from the game profile only if the user didn't already say
+    // one way or the other -- an explicit tcp_enabled/udp_enabled always
+    // wins, in either direction.
+    int tcp_enabled_eff = filter_cfg->tcp.enabled;
+
+    if (game_profile && game_profile->protocol == GAME_PROTO_TCP && tcp_enabled_eff == -1)
     {
-        filter.tcp.enabled = filter_cfg->tcp.enabled;
+        tcp_enabled_eff = 1;
+    }
+
+    if (tcp_enabled_eff > -1)
+    {
+        filter.tcp.enabled = tcp_enabled_eff;
     }
 
     port_range_t tcp_src_port_range = parse_port_range(filter_cfg->tcp.sport);
@@ -392,6 +419,17 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
     }
 
     port_range_t tcp_dst_port_range = parse_port_range(filter_cfg->tcp.dport);
+
+    // Only auto-fill the port when the resolved protocol is actually TCP
+    // and the user didn't already specify a port -- e.g. a rule with
+    // `game = "fivem"` and an explicit tcp_dport for the separate
+    // HTTP/NUI/asset-streaming port doesn't get overridden.
+    if (!tcp_dst_port_range.success && game_profile && game_profile->protocol == GAME_PROTO_TCP && tcp_enabled_eff)
+    {
+        tcp_dst_port_range.success = 1;
+        tcp_dst_port_range.min = game_profile->port_min;
+        tcp_dst_port_range.max = game_profile->port_max;
+    }
 
     if (tcp_dst_port_range.success)
     {
@@ -458,9 +496,16 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
         filter.tcp.cwr = filter_cfg->tcp.cwr;
     }
 
-    if (filter_cfg->udp.enabled > -1)
+    int udp_enabled_eff = filter_cfg->udp.enabled;
+
+    if (game_profile && game_profile->protocol == GAME_PROTO_UDP && udp_enabled_eff == -1)
     {
-        filter.udp.enabled = filter_cfg->udp.enabled;
+        udp_enabled_eff = 1;
+    }
+
+    if (udp_enabled_eff > -1)
+    {
+        filter.udp.enabled = udp_enabled_eff;
     }
 
     port_range_t udp_src_port_range = parse_port_range(filter_cfg->udp.sport);
@@ -475,6 +520,13 @@ int update_filter(int map_filters, filter_rule_cfg_t* filter_cfg, int idx)
     }
 
     port_range_t udp_dst_port_range = parse_port_range(filter_cfg->udp.dport);
+
+    if (!udp_dst_port_range.success && game_profile && game_profile->protocol == GAME_PROTO_UDP && udp_enabled_eff)
+    {
+        udp_dst_port_range.success = 1;
+        udp_dst_port_range.min = game_profile->port_min;
+        udp_dst_port_range.max = game_profile->port_max;
+    }
 
     if (udp_dst_port_range.success)
     {

@@ -98,4 +98,64 @@ struct
     __uint(max_entries, 1 << 16);
 } map_filter_log SEC(".maps");
 #endif
+
+#ifdef ENABLE_UDP_CHALLENGE
+// map_challenge/map_challenge6: timestamp (ns since boot) of the first
+// handshake-shaped packet seen from a source that hasn't been whitelisted
+// yet -- a second one arriving within a plausible real-client retry window
+// promotes the source into map_whitelist (see xdp/utils/challenge.h).
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1000000);
+    __type(key, u32);
+    __type(value, u64);
+} map_challenge SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 2000000);
+    __type(key, u32);
+    __type(value, u64); // timestamp (ns since boot) of when whitelisted
+} map_whitelist SEC(".maps");
+
+#ifdef ENABLE_IPV6
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1000000);
+    __type(key, u128);
+    __type(value, u64);
+} map_challenge6 SEC(".maps");
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 2000000);
+    __type(key, u128);
+    __type(value, u64);
+} map_whitelist6 SEC(".maps");
+#endif
+#endif
+#endif
+
+#ifdef ENABLE_ICMP_PROTECTION
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 2000000);
+    __type(key, u32);
+    __type(value, icmp_state_t);
+} map_icmp_state SEC(".maps");
+
+#ifdef ENABLE_IPV6
+struct
+{
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 2000000);
+    __type(key, u128);
+    __type(value, icmp_state_t);
+} map_icmp_state6 SEC(".maps");
+#endif
 #endif
