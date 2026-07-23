@@ -1,5 +1,11 @@
 #include <loader/utils/xdp.h>
 
+#ifdef ENABLE_HANDSHAKE_VERIFY
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#endif
+
 /**
  * Finds a BPF map's FD.
  * 
@@ -794,3 +800,84 @@ void update_range_drops(int map_range_drop, config__t* cfg)
         add_range_drop(map_range_drop, t.ip, t.cidr);
     }
 }
+
+#ifdef ENABLE_HANDSHAKE_VERIFY
+/**
+ * Runs a command via fork()+execvp() (never a shell -- argv is passed
+ * directly to exec, so there's no injection risk from `interface` even
+ * though it comes from config/CLI) and waits for it to finish.
+ *
+ * @param argv NULL-terminated argument vector (argv[0] is the program name).
+ *
+ * @return The child's exit code, or -1 on fork/wait failure.
+ */
+static int run_cmd(char* const argv[])
+{
+    pid_t pid = fork();
+
+    if (pid < 0)
+    {
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        // Silence stdout/stderr -- errors here are expected in normal
+        // operation (e.g. "qdisc already exists" on a re-attach).
+        int devnull = open("/dev/null", O_WRONLY);
+
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+        }
+
+        execvp(argv[0], argv);
+        _exit(127); // exec failed
+    }
+
+    int status = 0;
+
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        return -1;
+    }
+
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/**
+ * Attaches the TC egress program (tcp_egress_track, compiled into the
+ * same XDP_OBJ_PATH object) for ENABLE_HANDSHAKE_VERIFY, via the `tc` CLI
+ * tool rather than hand-rolled libbpf TC-hook API calls -- this is the
+ * exact same mechanism (and command shape) a human operator would use
+ * manually, so it's the most predictable option across kernel/iproute2
+ * versions. Idempotent: a clsact qdisc that already exists is a harmless
+ * no-op (errors from that specific step are ignored).
+ *
+ * @return 0 on success, non-zero on failure to attach the filter itself.
+ */
+int attach_tc_egress(const char* interface, const char* obj_path)
+{
+    char* qdisc_argv[] = { "tc", "qdisc", "add", "dev", (char*)interface, "clsact", NULL };
+    run_cmd(qdisc_argv); // ignore result -- "already exists" is expected on re-attach
+
+    char* filter_argv[] = {
+        "tc", "filter", "add", "dev", (char*)interface, "egress",
+        "bpf", "da", "obj", (char*)obj_path, "sec", "tc", NULL
+    };
+
+    return run_cmd(filter_argv);
+}
+
+/**
+ * Detaches the TC egress program by removing the clsact qdisc (this also
+ * removes any filters attached to it, including ours).
+ */
+int detach_tc_egress(const char* interface)
+{
+    char* argv[] = { "tc", "qdisc", "del", "dev", (char*)interface, "clsact", NULL };
+
+    return run_cmd(argv);
+}
+#endif

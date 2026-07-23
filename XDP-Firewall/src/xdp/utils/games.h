@@ -11,13 +11,10 @@
 // port -- catching floods that hit the right port with garbage/empty
 // payloads, which a port-only rule can't tell apart from a real client.
 //
-// Only signatures confirmed against public protocol documentation are
-// included here (same bar used throughout this project) -- a wrong
-// signature is worse than no signature. A couple of secondary/alternate
-// signatures from the source this was merged with (an alternate SAMP
-// magic, a bare-prefix Rust variant) were reviewed but not carried over
-// since they came from one specific production config this merge no
-// longer has access to re-verify against -- see README's merge notes.
+// Only signatures confirmed against public protocol documentation, or
+// re-supplied directly against the original production source this
+// project was merged from, are included here -- a wrong signature is
+// worse than no signature.
 //
 // Each check is a fixed-size direct byte comparison rather than a generic
 // length-parameterized loop -- more predictable for the BPF verifier than
@@ -78,18 +75,36 @@ static __always_inline int payload_is_ts3init(void *payload, void *data_end)
 }
 
 /**
- * San Andreas Multiplayer's query/handshake magic.
+ * San Andreas Multiplayer's query/handshake magic -- the literal "SAMP"
+ * 4-byte prefix, or an alternate 2-byte magic also seen in production
+ * (0x08, 0x1e).
  */
 static __always_inline int payload_is_samp(void *payload, void *data_end)
 {
     u8 *p = payload;
 
-    if (p + 4 > (u8 *)data_end)
+    if (p + 4 <= (u8 *)data_end && p[0] == 'S' && p[1] == 'A' && p[2] == 'M' && p[3] == 'P')
     {
-        return 0;
+        return 1;
     }
 
-    return p[0] == 'S' && p[1] == 'A' && p[2] == 'M' && p[3] == 'P';
+    if (p + 2 <= (u8 *)data_end && p[0] == 0x08 && p[1] == 0x1e)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * Rust accepts two query mechanisms in production: the RakNet handshake
+ * (payload_is_raknet) and a bare Source-engine-style A2S query prefix
+ * (payload_is_a2s) -- both explicitly validated against the original
+ * production config this project was merged from.
+ */
+static __always_inline int payload_is_rust(void *payload, void *data_end)
+{
+    return payload_is_raknet(payload, data_end) || payload_is_a2s(payload, data_end);
 }
 
 /**
@@ -117,6 +132,8 @@ static __always_inline int payload_matches_game(u8 game_id, void *payload, void 
     switch (game_id)
     {
         case GAME_RUST:
+            return payload_is_rust(payload, data_end);
+
         case GAME_FIVEM:
         case GAME_MINECRAFT_BE:
         case GAME_UNTURNED:

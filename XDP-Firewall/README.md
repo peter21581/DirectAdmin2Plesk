@@ -8,18 +8,19 @@ I ultimately hope this tool helps existing network engineers and programmers int
 
 This is a merge of [gamemann/XDP-Firewall](https://github.com/gamemann/XDP-Firewall) (MIT-licensed, see `LICENSE.md`) — its loader, `libconfig`-driven `xdpfw.conf` runtime configuration (no rebuild needed to change rules), pinned-BPF-map `xdpfw-add`/`xdpfw-del` CLI tools, systemd service, and `install.sh`/`Makefile` build system are kept essentially as-is — with game-server-focused protections ported in from a second, compile-time-flag-based XDP firewall this repository used to contain.
 
-**Always on, no config needed** (IPv4 + IPv6, toggle each independently in `src/common/config.h` if you want to turn one off — all four are on by default):
+**Always on, no config needed** (IPv4 + IPv6, toggle each independently in `src/common/config.h` if you want to turn one off — all five are on by default):
 - **Bogon source filtering** — `ENABLE_BOGON_FILTER`.
 - **Anti-spoofing** — `ENABLE_ANTI_SPOOF`: invalid TCP flag combinations (null/Xmas/nmap-style scans) and reflected privileged-UDP-source-port floods.
-- **UDP reflection/amplification protection** — `ENABLE_AMP_PROTECTION`, with a known-public-DNS-resolver exemption. Bundled with known-bad UDP payload / ASCII-garbage-flood detection (`ENABLE_BAD_PAYLOAD_FILTER`).
+- **UDP reflection/amplification protection** — `ENABLE_AMP_PROTECTION`, with a known-public-DNS/NTP-resolver exemption (IPv4 + IPv6). Bundled with known-bad UDP payload / ASCII-garbage-flood detection (`ENABLE_BAD_PAYLOAD_FILTER`).
 - **ICMP flood protection** — `ENABLE_ICMP_PROTECTION`, a weighted per-source-IP budget.
+- **Adaptive TCP/UDP packet budget** — `ENABLE_ADAPTIVE_RATE_LIMIT`: catches floods that don't match any of the above (including at ports no `filters` rule covers) and auto-blackholes the source, reusing the same block map a filter rule's own `block_time` uses. The trusted DNS/NTP resolvers above are exempt from this too.
 
 **Opt-in per rule** — add `game = "..."` to a `filters` entry (see [The `game` filter option](#-the-game-filter-option)):
 - A payload signature check for games with a well-understood handshake (RakNet-based titles, Source-engine/Steam A2S, TeamSpeak 3, SAMP) — catches a flood that hits the right port with a garbage/empty payload, which a port-only rule can't tell apart from a real client.
 - Setting `game` alone, with no `udp_enabled`/`tcp_enabled`/ports specified, auto-fills that game's conventional protocol and port — an explicit value in the rule always overrides the profile default.
 - For games whose handshake is well-understood enough to validate (see the profile table below), a spoof-resistant **UDP challenge/response** system (`ENABLE_UDP_CHALLENGE`) automatically applies too — no separate toggle needed beyond picking one of those games.
 
-**Not carried over in this merge** (documented, not silently dropped — see [Merge notes](#-merge-notes-whats-not-carried-over) at the bottom): SYN-flood OS-fingerprint weighting, Tor relay (ORPort) connection-flood mitigation, full TCP handshake verification, and the old project's Python `monitor.py` TUI/Prometheus exporter. Each is either a substantial standalone subsystem or (for the challenge/response system) was deliberately redesigned rather than ported verbatim — see below.
+**Advanced, opt-in** (off by default — see [Advanced, opt-in protections](#-advanced-opt-in-protections)): an active cookie-echo variant of the challenge/response system, SYN-flood OS-fingerprint weighting with subnet-level SYN limiting, Tor relay (ORPort) connection-flood mitigation, and full TCP handshake verification (catches pure ACK-floods, needs a second TC-egress attach point). Each is a bigger commitment than the always-on protections above, with its own tradeoffs — read its section before enabling.
 
 ## 🚀 Features Overview
 All features can be enabled or disabled through the build-time configuration ([`config.h`](./src/common/config.h) before compilation) or runtime configuration on disk. If you're planning to only use certain features such as the source IP block and drop functionality, it is recommended you disable other features like dynamic filtering to achieve best performance.
@@ -72,9 +73,10 @@ All features can be enabled or disabled through the build-time configuration ([`
 ### 🛡️ Always-On Core Protections
 * **Bogon filtering** — drops packets from bogon/special-use source addresses (RFC1918, loopback, link-local, CGNAT, documentation ranges, multicast, reserved space).
 * **Anti-spoofing** — drops invalid TCP flag combinations (null/Xmas/nmap-style scans) and reflected privileged-UDP-source-port floods.
-* **Amplification protection** — drops oversized DNS/NTP/memcached/SSDP/chargen/CLDAP/SNMP/portmap "replies" this box never solicited, with a known-public-DNS-resolver exemption. Bundled with known-bad UDP payload / ASCII-garbage-flood detection.
+* **Amplification protection** — drops oversized DNS/NTP/memcached/SSDP/chargen/CLDAP/SNMP/portmap "replies" this box never solicited, with a known-public-DNS/NTP-resolver exemption (Google, Cloudflare -- IPv4 and IPv6). Bundled with known-bad UDP payload / ASCII-garbage-flood detection.
 * **ICMP flood protection** — a weighted per-source-IP packet budget (echo requests cost less than rarer, more-often-abusive ICMP types).
-* All toggle independently in [`config.h`](./src/common/config.h) (`ENABLE_BOGON_FILTER`, `ENABLE_ANTI_SPOOF`, `ENABLE_AMP_PROTECTION`, `ENABLE_BAD_PAYLOAD_FILTER`, `ENABLE_ICMP_PROTECTION`) — **all on by default**, no `filters` rule required, and **independent of `ENABLE_FILTERS`** too: even if you compile out dynamic filter rules entirely for a minimal block-map-only build, these core protections still run. Only game/app-specific matching needs an explicit rule (and needs `ENABLE_FILTERS`, since it's implemented as a filter rule option).
+* **Adaptive TCP/UDP packet budget** — a 1-second rolling per-source-IP packet count across all TCP/UDP traffic; exceeding it auto-blackholes the source into the same block map a filter rule's own `block_time` uses. Closes the gap the checks above don't: a flood that doesn't match any specific signature and hits a port no `filters` rule covers (including a pure TCP ACK flood). Known DNS/NTP resolvers are exempt.
+* All toggle independently in [`config.h`](./src/common/config.h) (`ENABLE_BOGON_FILTER`, `ENABLE_ANTI_SPOOF`, `ENABLE_AMP_PROTECTION`, `ENABLE_BAD_PAYLOAD_FILTER`, `ENABLE_ICMP_PROTECTION`, `ENABLE_ADAPTIVE_RATE_LIMIT`) — **all on by default**, no `filters` rule required, and **independent of `ENABLE_FILTERS`** too: even if you compile out dynamic filter rules entirely for a minimal block-map-only build, these core protections still run. Only game/app-specific matching needs an explicit rule (and needs `ENABLE_FILTERS`, since it's implemented as a filter rule option).
 
 ## 🛠️ Building & Installing
 Before building, ensure the following packages are installed. These packages can be installed with `apt` on Debian-based systems (e.g. Ubuntu, etc.), but there should be similar names in other package managers.
@@ -296,12 +298,12 @@ Supported values (case-insensitive), with each game's default profile:
 
 | Value | Game(s) | Protocol | Default port | Payload signature | Challenge/response |
 | ---- | ---- | ---- | ---- | ---- | ---- |
-| `rust` | Rust | UDP | 28015 | RakNet `OFFLINE_MESSAGE_DATA_ID` magic (16 bytes) | Yes |
+| `rust` | Rust | UDP | 28015 | RakNet `OFFLINE_MESSAGE_DATA_ID` magic (16 bytes), or a bare Source-engine-style A2S query prefix (both accepted in production) | Yes |
 | `fivem` | FiveM / RedM | UDP | 30120 | Same RakNet magic | Yes |
 | `minecraft_be` | Minecraft: Bedrock Edition | UDP | 19132 | Same RakNet magic | Yes |
 | `minecraft_java` | Minecraft: Java Edition | TCP | 25565 | none (proprietary varint handshake) | No |
 | `source_engine` | Any Source-engine/Steam game (CS:GO, CS2, TF2, GMod, L4D/L4D2, Insurgency, etc.) | UDP | 27015 | Steam A2S query prefix (`0xFFFFFFFF`) | Yes |
-| `samp` | San Andreas Multiplayer | UDP | 7777 | `"SAMP"` 4-byte magic | Yes |
+| `samp` | San Andreas Multiplayer | UDP | 7777 | `"SAMP"` 4-byte magic, or an alternate 2-byte magic also seen in production | Yes |
 | `ts3` | TeamSpeak 3 | UDP | 9987 | `"TS3INIT1"` UDP handshake preamble | Yes |
 | `ark` | ARK: Survival Evolved | UDP | 7777 | none (port-scope only) | No |
 | `squad` | Squad | UDP | 7787 | none | No |
@@ -314,7 +316,9 @@ Supported values (case-insensitive), with each game's default profile:
 
 The full list of ports/protocols/defaults lives in [`src/common/games.h`](./src/common/games.h)'s `GAME_PROFILES` table.
 
-**Games marked "none" for payload signature are port-scope only** — `game` still auto-fills protocol/port for convenience, and still labels the rule for your own reference, but no payload validation happens (there's no publicly confirmed magic-byte signature for that game's protocol, and a wrong signature is worse than no signature — a couple of secondary/alternate signatures from the project this was merged from were reviewed and deliberately not carried over for the same reason). These games get ordinary header-based filtering plus this engine's rate-limiting/block-map protection, same as any other rule.
+**Games marked "none" for payload signature are port-scope only** — `game` still auto-fills protocol/port for convenience, and still labels the rule for your own reference, but no payload validation happens (there's no publicly confirmed magic-byte signature for that game's protocol re-verifiable against the original production source, and a wrong signature is worse than no signature — see [Merge notes](#-merge-notes-whats-still-not-carried-over) for the two that were reviewed and left out for that reason). These games get ordinary header-based filtering plus this engine's rate-limiting/block-map protection, same as any other rule.
+
+`is_known_bad_udp_payload()` (`ENABLE_BAD_PAYLOAD_FILTER`, see [Always-On Core Protections](#️-always-on-core-protections)) also checks two opaque flood-tool/botnet-payload fingerprints re-supplied against the original production source, beyond the literal `"flood"` filler string.
 
 **FiveM's TCP side** (HTTP/NUI/asset streaming, typically ports 30000-32000) needs its own separate manual rule — don't set `game = "fivem"` on it. FiveM's profile is UDP-only (the RakNet signature check would never match real HTTP traffic and the rule would silently block everything). Just use plain `tcp_enabled`/`tcp_dport` without `game` for that rule; it still gets full header-based/rate-limit protection.
 
@@ -548,17 +552,34 @@ A tool that generates and sends packets using technologies such as **fast [AF_XD
 ### [Kilimanjaro](https://github.com/gamemann/Kilimanjaro)
 This is a complex packet processing/forwarding/dropping project I made for a gaming community I was a part of that utilizes XDP, AF_XDP, and the IPIP network protocol. I no longer work on/maintain the project, but the source code may be very helpful to other XDP developers, especially when it comes to manipulating packets inside of XDP and such.
 
-## 🔀 Merge notes: what's not carried over
-The compile-time-flag-based firewall this repo used to be (single `filter.c`, no runtime config) had a few subsystems that are **still not** ported into this merge — each is either a substantial, standalone piece of state/logic in its own right, or (for the UDP challenge/response system) was deliberately redesigned rather than ported verbatim. Tracked as follow-up work, not silently dropped:
+## 🔬 Advanced, opt-in protections
+Each of these is off by default in [`config.h`](./src/common/config.h) — bigger architectural commitments than the always-on protections above, each with its own tradeoffs. Uncomment the flag and rebuild (`make`) to turn one on; each needs no `xdpfw.conf` changes beyond what its section below says.
 
-* **Spoof-resistant UDP challenge/response was reimplemented, not ported verbatim.** The old design sent a crafted cookie-echo reply packet (`XDP_TX`) and expected the real client to echo it back — reconstructing that exactly from memory, with no compiler or test environment to verify it, risked silently breaking every real client's connection if any protocol-level detail was wrong. This merge instead uses a passive "seen-twice within a plausible retry window" validator — see [The `game` filter option](#-the-game-filter-option)'s "Spoof-resistant challenge/response" section for the full design rationale and its tradeoffs versus the original active-challenge approach.
-* **SYN-flood OS-fingerprint weighting.** The old design gave a cheaper per-IP rate-limit "cost" to SYN packets shaped like a real Windows client and a stricter cost to implausible ones, on top of a flat pps/bps threshold. This engine's `ip_pps`/`flow_pps` rate limiting is flat-cost per packet; weighting would need a change to how `update_ip_stats()`/`update_flow_stats()` account for a packet — a change to the core rate-limiting accounting shared by every filter rule, not a self-contained addition like the other protections in this merge.
-* **Tor relay (ORPort) connection-flood mitigation.** A dual time-window new-connection-rate blacklist plus a live concurrent-connection cap, tuned for a specific low-packet-rate/high-connection-count attack pattern against Tor relays. This is deployment-specific (not a "game" or generic protection) and would need its own maps and its own companion sync script (to populate a known-relay allowlist from Tor's consensus) — a bigger, more self-contained follow-up than something to bolt on here.
-* **Full TCP handshake verification.** Rejecting any non-SYN TCP packet whose flow never had a real SYN → SYN-ACK → ACK observed (catches pure ACK-floods). Needs a second, TC-egress-hook BPF program (this engine is XDP-ingress-only) sharing a flow-state map with the main program, plus a loader-side second attach step. Was optional/off-by-default even in the old design due to its own explicit performance tradeoffs (a map lookup on every established-connection packet).
+#### `ENABLE_UDP_ACTIVE_CHALLENGE`
+Replaces the passive "seen-twice" challenge validator (see [The `game` filter option](#-the-game-filter-option)) with an **active** cookie-echo challenge, ported from the original design this project was merged from: on a source's first handshake-shaped packet, this box drops it, generates a random cookie, and sends a crafted 4-byte-payload UDP reply (`XDP_TX`) back to the source; a subsequent packet whose first 4 bytes match the cookie whitelists the source immediately, faster than waiting for a natural retry. Requires `ENABLE_UDP_CHALLENGE` to also be on. This is a generic probe, not a valid RakNet/A2S/TS3/SAMP protocol reply — whether a given game client's stack does anything useful with it depends on that client's own implementation. Where it doesn't help, it degrades gracefully to the same outcome as the passive validator alone (both run together; whichever succeeds first wins).
+
+#### `ENABLE_SYN_PROTECTION`
+Three refinements to new-TCP-connection handling that share one toggle since they're one cohesive unit: OS-plausibility weighting of each SYN's cost against `ENABLE_ADAPTIVE_RATE_LIMIT`'s budget (TTL/window-based — an implausible or non-Windows-shaped SYN costs more), a subnet-level (not just per-IP) new-SYN-rate check (`SUBNET_MASK_BITS`/`SUBNET_SYN_LIMIT`/`SUBNET_MASK_BITS_V6`, catches a botnet spread across one block), and a SYN-packet-size sanity check (rejects a SYN whose total size doesn't match any real OS's handshake shape, before any map lookup).
+
+#### `ENABLE_TOR_RELAY`
+Mitigation for the connection-flood attacks that have targeted Tor relays' ORPort (default port 9001, override with `TOR_ORPORT`) — a layer-7, low-packet-rate, high-connection-count attack pattern that `ENABLE_ADAPTIVE_RATE_LIMIT`'s packet-rate budget doesn't catch. Directory authorities and snowflake bridges are hardcoded and always exempt; known relay IPs get a higher concurrent-connection cap (`TOR_RELAY_CONN_LIMIT`) and immunity from the connection-rate blacklist (`TOR_FAST_LIMIT`/`TOR_SLOW_LIMIT`/`TOR_BLACKLIST_TIME`) once populated by the companion **`tor-relay-sync.py`** script, which parses Tor's own `cached-consensus` (run daily via cron, and once via an `ExecStartPost` hook on `xdpfw.service` so the set isn't empty right after (re)attach):
+
+```bash
+python3 tor-relay-sync.py                       # uses /var/lib/tor/cached-consensus, user debian-tor
+python3 tor-relay-sync.py --tor-user debian-tor --consensus /var/lib/tor/cached-consensus
+```
+
+Same privilege-separation reasoning as the original design this was ported from: the consensus file's content is attacker-influenceable, so the actual parsing runs as the unprivileged Tor user (`runuser`), not as root — only the result, re-validated as well-formed IPs, reaches the privileged `bpftool` calls (against the pinned `map_tor_known_relays`/`map_tor_known_relays6` maps). This is deployment-specific — only turn it on if this box actually runs a Tor relay.
+
+#### `ENABLE_HANDSHAKE_VERIFY`
+Rejects any non-SYN TCP packet whose flow never had a real SYN → SYN-ACK → ACK observed, catching pure ACK-floods that nothing else here can see (`ENABLE_ADAPTIVE_RATE_LIMIT` still rate-limits them, but doesn't verify them). IPv4 only. Needs a second attach point beyond the XDP hook: a **TC egress hook** (`tcp_egress_track`, compiled into the same `xdp_prog.o`), since this program never sends its own SYN-ACKs from the ingress-only XDP side and has no other way to observe "did we really reply to this SYN". The loader attaches/detaches this automatically (via the standard `tc qdisc`/`tc filter` commands, run through `execvp` — never a shell, so there's no injection risk from the interface name) whenever built with this flag on; a failed TC attach is a warning, not fatal (the XDP program and every other protection stay up regardless).
+
+Real costs, same as the design this was ported from: every established-connection packet now costs a map lookup (no longer zero-touch), and any connection already open before this loads has no tracked handshake state and gets rejected once as unverified.
+
+## 🔀 Merge notes: what's still not carried over
 * **`monitor.py`'s TUI dashboard and Prometheus exporter.** This engine's loader already prints live stats to stdout and every protection in this merge shows up in the same `map_stats` counters, but there's no live curses dashboard or `/metrics` HTTP endpoint here yet.
-* **A few secondary payload signatures** from the old design (an alternate 2-byte SAMP magic, a bare Source-engine-style Rust query prefix, two additional flood-tool fingerprints beyond the `"flood"` string) were reviewed but not carried over — they came from one specific production config the old design was ported from, which this merge no longer has access to re-verify against. A wrong signature is worse than no signature. Several games (see the `game` option's table above) are intentionally port-scope-only for the same reason — no publicly confirmed payload signature to check.
-* **IPv6 known-DNS/NTP-resolver exemption** for `ENABLE_AMP_PROTECTION` — the IPv4 path exempts Google/Cloudflare's well-known resolvers from the size-based DNS check; the IPv6 path is deliberately conservative (no exemption at all) rather than guessing at IPv6 resolver addresses without re-verifying them.
-* **Not compiled or verifier-tested.** Same caveat as this whole project always carries: this merge's new code (`xdp/utils/games.h`, `bogon.h`, `payload.h`, `amp.h`, `antispoof.h`, `icmp_protect.h`, `challenge.h`, and the `filter_t`/config-parsing/`update_filter()` changes) was written and reasoned through carefully, but there is no Linux/eBPF/`libconfig` toolchain available in the environment it was written in. Build it (`make`) and check `dmesg`/the BPF verifier output on a real box before relying on it in production.
+* **Two payload-only signatures from the original design were reviewed but not carried over**: an ARK "VS01" alternate query magic and a few UE4-engine games' generic empty/zeroed-payload heuristics (Mordhau/Squad/HLL/AltV) — these were pattern-matches broad enough (a handful of specific leading bytes on a shared port range) that re-applying them outside their original narrow context risked more false positives than they're worth. Those games stay port-scope-only (see the `game` option's table above) rather than getting a low-confidence signature.
+* **Not compiled or verifier-tested.** Same caveat as this whole project always carries: none of this merge's new code was built against a real Linux/eBPF/`libconfig` toolchain, which wasn't available in the environment it was written in. Build it (`make`) and check `dmesg`/the BPF verifier output on a real box before relying on it in production -- especially `ENABLE_UDP_ACTIVE_CHALLENGE` and `ENABLE_HANDSHAKE_VERIFY`, the two riskiest/most invasive additions here.
 
 ## 🙌 Credits
 * [Christian Deacon](https://github.com/gamemann) - Creator of the original XDP-Firewall this was merged with.

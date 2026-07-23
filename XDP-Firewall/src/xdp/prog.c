@@ -6,6 +6,7 @@
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
 #include <linux/in.h>
+#include <linux/pkt_cls.h>
 #include <stdatomic.h>
 
 #include <common/all.h>
@@ -19,6 +20,9 @@
 #include <xdp/utils/amp.h>
 #include <xdp/utils/antispoof.h>
 #include <xdp/utils/icmp_protect.h>
+#include <xdp/utils/adaptive_rl.h>
+#include <xdp/utils/syn_protect.h>
+#include <xdp/utils/tor.h>
 
 #include <xdp/utils/maps.h>
 
@@ -235,6 +239,90 @@ int xdp_prog_main(struct xdp_md *ctx)
                 }
 #endif
 
+#ifdef ENABLE_HANDSHAKE_VERIFY
+                // Full handshake verification -- see config.h's
+                // ENABLE_HANDSHAKE_VERIFY comment and README.md's matching
+                // section before enabling this. Framed from the peer's
+                // point of view (see tcp_flow_key_t's comment): on
+                // ingress, the peer is always whoever sent us this packet.
+                {
+                    tcp_flow_key_t hs_key = {
+                        .peer_ip = iph->saddr,
+                        .peer_port = ntohs(tcph->source),
+                        .local_port = ntohs(tcph->dest)
+                    };
+
+                    if (tcph->fin || tcph->rst)
+                    {
+                        // Connection closing -- stop tracking it either
+                        // way, whether it was ever established or not.
+                        bpf_map_delete_elem(&map_tcp_handshake, &hs_key);
+                    }
+                    else if (tcph->syn && !tcph->ack)
+                    {
+                        // New inbound connection attempt (we'd be the
+                        // server). No state to check yet -- state gets
+                        // created on OUR egress SYN-ACK reply
+                        // (tcp_egress_track below), once the kernel
+                        // actually decides to answer it. Falls through to
+                        // the SYN-flood protection further down.
+                    }
+                    else
+                    {
+                        // Either a SYN-ACK arriving inbound (we'd be the
+                        // client) or a non-SYN packet (established data,
+                        // or the client's final handshake ACK).
+                        tcp_flow_state_t *hs = bpf_map_lookup_elem(&map_tcp_handshake, &hs_key);
+
+                        if (hs && (hs->established || now - hs->ts < HANDSHAKE_TIMEOUT_NS))
+                        {
+                            if (!hs->established)
+                            {
+                                hs->established = 1;
+                                hs->ts = now;
+                            }
+                        }
+                        else
+                        {
+                            // No matching handshake ever observed for
+                            // this flow (or it timed out) -- exactly the
+                            // pure-ACK-flood / unsolicited SYN-ACK shape
+                            // this feature exists to catch.
+                            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                            return XDP_DROP;
+                        }
+                    }
+                }
+#endif
+
+#ifdef ENABLE_TOR_RELAY
+                // ORPort connection-flood mitigation (see config.h's
+                // ENABLE_TOR_RELAY comment and xdp/utils/tor.h). Runs
+                // independently of ENABLE_ADAPTIVE_RATE_LIMIT above (that
+                // one budgets by packet rate; this attack is low-PPS,
+                // high-connection-count, so it needs its own mechanism).
+                if (ntohs(tcph->dest) == TOR_ORPORT && !is_tor_trusted_v4(iph->saddr))
+                {
+                    if (tcph->syn && !tcph->ack)
+                    {
+                        int tor_is_relay = tor_is_known_relay_v4(iph->saddr);
+                        int tor_verdict = tor_conn_check_v4(iph->saddr, now, tor_is_relay);
+
+                        if (tor_verdict != TOR_CONN_ALLOW)
+                        {
+                            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                            return XDP_DROP;
+                        }
+                    }
+                    else if (tcph->fin || tcph->rst)
+                    {
+                        tor_conn_release_v4(iph->saddr);
+                    }
+                }
+#endif
+
                 break;
 
             case IPPROTO_UDP:
@@ -346,6 +434,28 @@ int xdp_prog_main(struct xdp_md *ctx)
                 }
 #endif
 
+#ifdef ENABLE_TOR_RELAY
+                if (ntohs(tcph->dest) == TOR_ORPORT && !is_tor_trusted_v6(iph6->saddr.in6_u.u6_addr32))
+                {
+                    if (tcph->syn && !tcph->ack)
+                    {
+                        int tor_is_relay = tor_is_known_relay_v6(iph6->saddr.in6_u.u6_addr32);
+                        int tor_verdict = tor_conn_check_v6(src_ip6, now, tor_is_relay);
+
+                        if (tor_verdict != TOR_CONN_ALLOW)
+                        {
+                            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                            return XDP_DROP;
+                        }
+                    }
+                    else if (tcph->fin || tcph->rst)
+                    {
+                        tor_conn_release_v6(src_ip6);
+                    }
+                }
+#endif
+
                 break;
 
             case IPPROTO_UDP:
@@ -387,7 +497,7 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 
 #ifdef ENABLE_AMP_PROTECTION
-                if (is_amp_flood_v6(ntohs(udph->source), (u32)(data_end - payload)))
+                if (is_amp_flood_v6(iph6->saddr.in6_u.u6_addr32, ntohs(udph->source), (u32)(data_end - payload)))
                 {
                     inc_pkt_stats(stats, STATS_TYPE_DROPPED);
 
@@ -424,6 +534,109 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 
                 break;
+        }
+    }
+#endif
+
+#ifdef ENABLE_ADAPTIVE_RATE_LIMIT
+    // Always-on TCP/UDP packet budget -- catches floods that don't match
+    // any of the more specific signatures above, regardless of port (see
+    // config.h's ENABLE_ADAPTIVE_RATE_LIMIT comment). Known DNS/NTP
+    // resolvers are exempted so legitimate resolver traffic never trips it.
+    if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP)
+    {
+        int trusted = 0;
+        u32 weight = 1;
+
+        if (protocol == IPPROTO_UDP)
+        {
+            u16 sport_host = ntohs(src_port);
+
+            if (sport_host == 53 || sport_host == 123)
+            {
+                if (iph)
+                {
+                    trusted = sport_host == 53 ? is_known_public_dns(iph->saddr) : is_known_public_ntp(iph->saddr);
+                }
+#ifdef ENABLE_IPV6
+                else if (iph6)
+                {
+                    trusted = sport_host == 53
+                        ? is_known_public_dns_v6(iph6->saddr.in6_u.u6_addr32)
+                        : is_known_public_ntp_v6(iph6->saddr.in6_u.u6_addr32);
+                }
+#endif
+            }
+        }
+
+#ifdef ENABLE_SYN_PROTECTION
+        if (protocol == IPPROTO_TCP && tcph->syn && !tcph->ack)
+        {
+            // Cheapest check first, no map access: does this even look
+            // like a real OS's SYN packet by size?
+            if (iph && bad_syn_length_v4(iph))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+#ifdef ENABLE_IPV6
+            else if (iph6 && bad_syn_length_v6(iph6))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+#endif
+
+            // Subnet-level check before spending a per-IP map write --
+            // catches a botnet spread across one block before the
+            // adaptive budget below would (each IP might individually
+            // stay under it).
+            if (iph && subnet_syn_flood_v4(iph->saddr, now))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+#ifdef ENABLE_IPV6
+            else if (iph6 && subnet_syn_flood_v6(src_ip6, now))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+#endif
+
+            if (iph)
+            {
+                weight = syn_weight_v4(iph, tcph);
+            }
+#ifdef ENABLE_IPV6
+            else if (iph6)
+            {
+                weight = syn_weight_v6(iph6, tcph);
+            }
+#endif
+        }
+#endif
+
+        if (!trusted)
+        {
+            if (iph && adaptive_rate_limited_v4(iph->saddr, now, weight))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+#ifdef ENABLE_IPV6
+            else if (iph6 && adaptive_rate_limited_v6(src_ip6, now, weight))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+#endif
         }
     }
 #endif
@@ -516,6 +729,131 @@ int xdp_prog_main(struct xdp_md *ctx)
 
 #ifdef ENABLE_FILTERS
 matched:
+#ifdef ENABLE_UDP_ACTIVE_CHALLENGE
+    // Active cookie-echo challenge reply (see config.h's ENABLE_UDP_
+    // ACTIVE_CHALLENGE comment and xdp/utils/challenge.h) -- rule.c
+    // already decided this is needed (rule.action/block_time are also set
+    // to a plain drop as a fallback in case adjust_tail below fails).
+    if (rule.send_challenge && udph)
+    {
+        u8 src_mac[6], dst_mac[6];
+        memcpy(src_mac, eth->h_source, 6);
+        memcpy(dst_mac, eth->h_dest, 6);
+        __be16 sport_be = udph->source, dport_be = udph->dest;
+        u32 cookie = rule.challenge_cookie;
+
+        if (iph)
+        {
+            u32 daddr = iph->daddr, saddr = iph->saddr;
+
+            int new_len = (int)sizeof(*eth) + (int)sizeof(*iph) + (int)sizeof(*udph) + 4;
+            int diff = new_len - (int)(data_end - data);
+
+            if (bpf_xdp_adjust_tail(ctx, diff))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+
+            data = (void *)(long)ctx->data;
+            data_end = (void *)(long)ctx->data_end;
+
+            if (data + new_len > data_end)
+            {
+                return XDP_DROP;
+            }
+
+            eth = data;
+            memcpy(eth->h_dest, src_mac, 6);
+            memcpy(eth->h_source, dst_mac, 6);
+
+            iph = data + sizeof(*eth);
+            iph->ttl = 64;
+            iph->saddr = daddr;
+            iph->daddr = saddr;
+            iph->tot_len = htons(sizeof(*iph) + sizeof(*udph) + 4);
+            iph->check = ip_checksum(iph);
+
+            udph = (void *)(iph + 1);
+            udph->source = dport_be;
+            udph->dest = sport_be;
+            udph->len = htons(sizeof(*udph) + 4);
+            udph->check = 0; // optional for IPv4 UDP
+
+            u32 *cookie_out = (void *)(udph + 1);
+
+            if ((void *)(cookie_out + 1) > data_end)
+            {
+                return XDP_DROP;
+            }
+
+            *cookie_out = cookie;
+
+            inc_pkt_stats(stats, STATS_TYPE_DROPPED); // original request didn't reach the backend, replaced with a probe
+
+            return XDP_TX;
+        }
+#ifdef ENABLE_IPV6
+        else if (iph6)
+        {
+            u32 daddr6[4], saddr6[4];
+            memcpy(daddr6, iph6->daddr.in6_u.u6_addr32, 16);
+            memcpy(saddr6, iph6->saddr.in6_u.u6_addr32, 16);
+
+            int new_len = (int)sizeof(*eth) + (int)sizeof(*iph6) + (int)sizeof(*udph) + 4;
+            int diff = new_len - (int)(data_end - data);
+
+            if (bpf_xdp_adjust_tail(ctx, diff))
+            {
+                inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                return XDP_DROP;
+            }
+
+            data = (void *)(long)ctx->data;
+            data_end = (void *)(long)ctx->data_end;
+
+            if (data + new_len > data_end)
+            {
+                return XDP_DROP;
+            }
+
+            eth = data;
+            memcpy(eth->h_dest, src_mac, 6);
+            memcpy(eth->h_source, dst_mac, 6);
+
+            iph6 = data + sizeof(*eth);
+            iph6->hop_limit = 64;
+            memcpy(iph6->saddr.in6_u.u6_addr32, daddr6, 16);
+            memcpy(iph6->daddr.in6_u.u6_addr32, saddr6, 16);
+            iph6->payload_len = htons(sizeof(*udph) + 4);
+            iph6->nexthdr = IPPROTO_UDP;
+
+            udph = (void *)(iph6 + 1);
+            udph->source = dport_be;
+            udph->dest = sport_be;
+            udph->len = htons(sizeof(*udph) + 4);
+
+            u32 *cookie_out = (void *)(udph + 1);
+
+            if ((void *)(cookie_out + 1) > data_end)
+            {
+                return XDP_DROP;
+            }
+
+            *cookie_out = cookie;
+
+            udph->check = udp6_checksum(iph6->saddr.in6_u.u6_addr32, iph6->daddr.in6_u.u6_addr32, udph, sizeof(*udph) + 4);
+
+            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+            return XDP_TX;
+        }
+#endif
+    }
+#endif
+
     if (rule.action == 0)
     {
         // Before dropping, update the block map.
@@ -547,6 +885,69 @@ matched:
     return XDP_PASS;
 #endif
 }
+
+#ifdef ENABLE_HANDSHAKE_VERIFY
+// Egress half of full handshake verification (see config.h's
+// ENABLE_HANDSHAKE_VERIFY comment and README.md's matching section).
+// Attached as a separate TC egress hook -- NOT loaded/attached the same
+// way as xdp_prog_main above; the loader does this automatically for
+// builds with this flag on (see loader/utils/xdp.c's attach_tc_egress()).
+// Only records state; never itself blocks anything (an operator's own
+// outbound traffic should never be dropped by this program).
+SEC("tc")
+int tcp_egress_track(struct __sk_buff *skb)
+{
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+
+    struct ethhdr *eth = data;
+
+    if (data + sizeof(*eth) > data_end || eth->h_proto != htons(ETH_P_IP))
+    {
+        return TC_ACT_OK;
+    }
+
+    struct iphdr *ip = data + sizeof(*eth);
+
+    if ((void *)(ip + 1) > data_end || ip->protocol != IPPROTO_TCP || ip->ihl < 5)
+    {
+        return TC_ACT_OK;
+    }
+
+    struct tcphdr *tcp = (void *)ip + (ip->ihl * 4);
+
+    if ((void *)(tcp + 1) > data_end)
+    {
+        return TC_ACT_OK;
+    }
+
+    // Same key shape as the ingress side, but read from the egress
+    // fields: the peer is whoever we're sending this packet to.
+    tcp_flow_key_t key = {
+        .peer_ip = ip->daddr,
+        .peer_port = ntohs(tcp->dest),
+        .local_port = ntohs(tcp->source)
+    };
+
+    if (tcp->fin || tcp->rst)
+    {
+        bpf_map_delete_elem(&map_tcp_handshake, &key);
+
+        return TC_ACT_OK;
+    }
+
+    // Only a SYN (we're initiating, as a client) or a SYN-ACK (the
+    // kernel's own reply, as a server, to a SYN we let through on
+    // ingress) starts a new pending handshake.
+    if (tcp->syn)
+    {
+        tcp_flow_state_t st = { .established = 0, .ts = bpf_ktime_get_ns() };
+        bpf_map_update_elem(&map_tcp_handshake, &key, &st, BPF_ANY);
+    }
+
+    return TC_ACT_OK;
+}
+#endif
 
 char _license[] SEC("license") = "GPL";
 

@@ -39,13 +39,11 @@ static __always_inline int is_ascii_garbage_flood(void *payload, void *data_end)
 }
 
 /**
- * Checks a UDP payload against a small set of known-bad signatures.
- *
- * Only the literal "flood" filler-string fingerprint is carried over here --
- * a couple of other opaque-but-validated flood-tool fingerprints from the
- * project this was merged with weren't re-verifiable against their original
- * source and were left out rather than guessed at (see README's merge
- * notes) -- a wrong signature is worse than no signature.
+ * Checks a UDP payload against a small set of known-bad signatures --
+ * the literal "flood" filler string, plus two opaque-but-validated
+ * flood-tool fingerprints from the project this was merged from (their
+ * exact bytes, since re-supplied against the original production
+ * source -- see README's merge notes).
  *
  * @param payload Pointer to the first byte after the UDP header.
  * @param data_end The packet's data_end pointer.
@@ -56,14 +54,23 @@ static __always_inline int is_known_bad_udp_payload(void *payload, void *data_en
 {
     u8 *p = payload;
 
-    if (p + 5 > (u8 *)data_end)
+    if (p + 5 <= (u8 *)data_end &&
+        p[0] == 'f' && p[1] == 'l' && p[2] == 'o' && p[3] == 'o' && p[4] == 'd')
     {
-        return 0;
+        return 1; // literal ASCII filler text from a crude flood tool
     }
 
-    if (p[0] == 'f' && p[1] == 'l' && p[2] == 'o' && p[3] == 'o' && p[4] == 'd')
+    if (p + 4 <= (u8 *)data_end &&
+        p[0] == 'f' && p[1] == '8' && p[2] == 'f' && p[3] == '4')
     {
-        return 1;
+        return 1; // opaque booter-tool signature
+    }
+
+    if (p + 8 <= (u8 *)data_end &&
+        p[0] == 0xd6 && p[1] == 0x61 && p[2] == 0x6e && p[3] == 0x64 &&
+        p[4] == 0x28 && p[5] == 0x29 && p[6] == 0x25 && p[7] == 0x78)
+    {
+        return 1; // opaque botnet payload fragment
     }
 
     return 0;

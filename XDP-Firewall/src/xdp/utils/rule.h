@@ -53,6 +53,16 @@ struct rule_ctx
     struct icmphdr* icmph;
 
     struct icmp6hdr* icmph6;
+
+#ifdef ENABLE_UDP_ACTIVE_CHALLENGE
+    // Set by process_rule() when a game rule's challenge check decides an
+    // active cookie-echo reply should be sent instead of a plain drop --
+    // xdp_prog_main builds and sends the actual reply packet (needs the
+    // original ctx/data/data_end, which process_rule()'s bpf_loop callback
+    // doesn't have direct access to).
+    int send_challenge;
+    u32 challenge_cookie;
+#endif
 } typedef rule_ctx_t;
 
 #ifdef ENABLE_FILTERS

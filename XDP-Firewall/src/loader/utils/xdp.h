@@ -37,3 +37,8 @@ int add_block6(int map_block6, u128 ip, u64 expires);
 int delete_range_drop(int map_range_drop, u32 net, u8 cidr);
 int add_range_drop(int map_range_drop, u32 net, u8 cidr);
 void update_range_drops(int map_range_drop, config__t* cfg);
+
+#ifdef ENABLE_HANDSHAKE_VERIFY
+int attach_tc_egress(const char* interface, const char* obj_path);
+int detach_tc_egress(const char* interface);
+#endif

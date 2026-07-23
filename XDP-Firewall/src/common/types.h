@@ -162,14 +162,16 @@ struct cl_stats
     u64 next_update;
 } typedef cl_stats_t;
 
-// Per-source-IP ICMP flood counter (see xdp/utils/icmp_protect.h). Separate
-// from cl_stats_t since ICMP protection is always-on regardless of whether
-// ENABLE_RL_IP/ENABLE_RL_FLOW filter-rule rate limiting is compiled in.
-struct icmp_state
+// Generic per-source-IP rolling-window packet counter -- shared by
+// xdp/utils/icmp_protect.h (ICMP flood budget) and xdp/utils/adaptive_rl.h
+// (the always-on TCP/UDP packet budget). Separate from cl_stats_t since
+// both of those are always-on regardless of whether ENABLE_RL_IP/
+// ENABLE_RL_FLOW filter-rule rate limiting is compiled in.
+struct pps_state
 {
     u64 window_start;
     u32 pkt_count;
-} typedef icmp_state_t;
+} typedef pps_state_t;
 
 struct flow
 {
@@ -216,3 +218,47 @@ struct lpm_trie_key
     u32 prefix_len;
     u32 data;
 } typedef lpm_trie_key_t;
+
+// Same idea, IPv6 -- used by ENABLE_TOR_RELAY's known-relay map (see
+// xdp/utils/tor.h). prefix_len must stay first (LPM_TRIE requirement).
+struct lpm_trie_key6
+{
+    u32 prefix_len;
+    u32 data[4];
+} typedef lpm_trie_key6_t;
+
+// Dual time-window new-connection counter plus a live concurrent-
+// connection count, for ENABLE_TOR_RELAY's ORPort connection-flood
+// mitigation (see xdp/utils/tor.h).
+struct tor_conn_state
+{
+    u64 fast_window_start;
+    u32 fast_count;
+    u64 slow_window_start;
+    u32 slow_count;
+    u32 concurrent;
+    u64 blackhole_until;
+} typedef tor_conn_state_t;
+
+// ENABLE_HANDSHAKE_VERIFY's shared flow-tracking state (see xdp/prog.c's
+// xdp_prog_main ingress checks and tcp_egress_track TC program). Framed
+// from the external peer's point of view regardless of who initiated:
+// peer_ip/peer_port always belong to the other side, local_port always
+// belongs to this box -- so the exact same key is computed the same way
+// by both programs for a given flow (ingress reads it from saddr/source/
+// dest, egress reads the same fields from daddr/dest/source).
+struct tcp_flow_key
+{
+    u32 peer_ip;
+    u16 peer_port;
+    u16 local_port;
+} typedef tcp_flow_key_t;
+
+// established=0 means "a handshake packet was sent, waiting for the
+// peer's next expected packet" (not yet trusted). established=1 means a
+// real handshake actually completed.
+struct tcp_flow_state
+{
+    u8 established;
+    u64 ts; // last transition, used to time out a stuck pending handshake
+} typedef tcp_flow_state_t;

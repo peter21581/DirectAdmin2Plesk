@@ -25,7 +25,7 @@ static __always_inline u32 icmp_weight_v4(struct icmphdr *icmp)
 
 static __always_inline int icmp_rate_limited_v4(u32 ip, u32 weight, u64 now)
 {
-    icmp_state_t *st = bpf_map_lookup_elem(&map_icmp_state, &ip);
+    pps_state_t *st = bpf_map_lookup_elem(&map_icmp_state, &ip);
 
     if (st)
     {
@@ -42,7 +42,7 @@ static __always_inline int icmp_rate_limited_v4(u32 ip, u32 weight, u64 now)
         return st->pkt_count > ICMP_PPS_LIMIT;
     }
 
-    icmp_state_t new_st = { .window_start = now, .pkt_count = weight };
+    pps_state_t new_st = { .window_start = now, .pkt_count = weight };
     bpf_map_update_elem(&map_icmp_state, &ip, &new_st, BPF_ANY);
 
     return 0;
@@ -56,7 +56,7 @@ static __always_inline u32 icmp_weight_v6(struct icmp6hdr *icmp6)
 
 static __always_inline int icmp_rate_limited_v6(u128 ip, u32 weight, u64 now)
 {
-    icmp_state_t *st = bpf_map_lookup_elem(&map_icmp_state6, &ip);
+    pps_state_t *st = bpf_map_lookup_elem(&map_icmp_state6, &ip);
 
     if (st)
     {
@@ -73,7 +73,7 @@ static __always_inline int icmp_rate_limited_v6(u128 ip, u32 weight, u64 now)
         return st->pkt_count > ICMP_PPS_LIMIT;
     }
 
-    icmp_state_t new_st = { .window_start = now, .pkt_count = weight };
+    pps_state_t new_st = { .window_start = now, .pkt_count = weight };
     bpf_map_update_elem(&map_icmp_state6, &ip, &new_st, BPF_ANY);
 
     return 0;

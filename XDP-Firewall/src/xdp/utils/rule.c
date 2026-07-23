@@ -313,12 +313,24 @@ static __always_inline long process_rule(u32 idx, void* data)
     {
         u64 now = bpf_ktime_get_ns();
         int trusted = 0;
+#ifdef ENABLE_UDP_ACTIVE_CHALLENGE
+        u32 cookie = 0;
+#endif
 
         if (ctx->iph)
         {
             u32 ip = ctx->iph->saddr;
 
-            trusted = challenge_is_whitelisted_v4(ip, now) || challenge_track_v4(ip, now);
+            trusted = challenge_is_whitelisted_v4(ip, now);
+
+            if (!trusted)
+            {
+#ifdef ENABLE_UDP_ACTIVE_CHALLENGE
+                trusted = challenge_check_v4(ip, ctx->payload, ctx->data_end, now, &cookie);
+#else
+                trusted = challenge_check_v4(ip, NULL, NULL, now, NULL);
+#endif
+            }
         }
 #ifdef ENABLE_IPV6
         else if (ctx->iph6)
@@ -326,7 +338,16 @@ static __always_inline long process_rule(u32 idx, void* data)
             u128 ip6;
             memcpy(&ip6, ctx->iph6->saddr.in6_u.u6_addr32, sizeof(ip6));
 
-            trusted = challenge_is_whitelisted_v6(ip6, now) || challenge_track_v6(ip6, now);
+            trusted = challenge_is_whitelisted_v6(ip6, now);
+
+            if (!trusted)
+            {
+#ifdef ENABLE_UDP_ACTIVE_CHALLENGE
+                trusted = challenge_check_v6(ip6, ctx->payload, ctx->data_end, now, &cookie);
+#else
+                trusted = challenge_check_v6(ip6, NULL, NULL, now, NULL);
+#endif
+            }
         }
 #endif
 
@@ -338,6 +359,11 @@ static __always_inline long process_rule(u32 idx, void* data)
             ctx->matched = 1;
             ctx->action = 0;
             ctx->block_time = 0;
+
+#ifdef ENABLE_UDP_ACTIVE_CHALLENGE
+            ctx->send_challenge = 1;
+            ctx->challenge_cookie = cookie;
+#endif
 
             return 1;
         }

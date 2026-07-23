@@ -116,6 +116,28 @@
 #define ICMP_PPS_LIMIT 200 // packets/sec budget before a source's ICMP gets dropped
 #endif
 
+// Always-on per-source-IP TCP/UDP packet budget with auto-blackholing --
+// closes the gap the rest of this file's protections don't: a flood that
+// doesn't match any bogon/anti-spoof/amplification signature and hits a
+// port no `filters` rule covers (or a pure TCP ACK flood -- no SYN, no
+// game payload, nothing else here inspects it) previously sailed straight
+// through. This is a 1-second rolling packet budget per source IP across
+// ALL TCP/UDP traffic; exceeding it blackholes the source into the same
+// map_block/map_block6 maps a filter rule's block_time already uses --
+// reuses the exact mechanism this engine already has, no new drop path.
+// Known public DNS/NTP resolvers are exempted (see
+// xdp/utils/amp.h's is_known_public_dns()/is_known_public_ntp()) so
+// legitimate high-volume resolver traffic this box solicited never gets
+// blackholed. ICMP has its own separate budget (ENABLE_ICMP_PROTECTION
+// above); this only covers TCP/UDP.
+#define ENABLE_ADAPTIVE_RATE_LIMIT
+#ifndef ADAPTIVE_PPS_LIMIT
+#define ADAPTIVE_PPS_LIMIT 2000 // packets/sec budget before a source gets blackholed
+#endif
+#ifndef ADAPTIVE_BLOCK_TIME
+#define ADAPTIVE_BLOCK_TIME 30 // seconds to blackhole a source that exceeds the budget
+#endif
+
 // The spoof-resistant UDP challenge/response system: for a filter rule
 // whose game profile has needs_challenge (see common/games.h), a source
 // isn't trusted on its first handshake-shaped packet alone -- that packet
@@ -131,4 +153,109 @@
 #define ENABLE_UDP_CHALLENGE
 #ifndef UDP_CHALLENGE_TTL
 #define UDP_CHALLENGE_TTL 180 // seconds a source stays trusted after passing the challenge
+#endif
+
+// ==== Advanced, opt-in protections (all off by default) ====
+// Each of these is a bigger architectural or behavioral commitment than the
+// always-on protections above -- read its comment before enabling.
+
+// Replaces the passive "seen-twice" challenge validator above with the
+// original design's active cookie-echo challenge: on a source's first
+// handshake-shaped packet, this box drops it, generates a random cookie,
+// and sends a crafted UDP reply (XDP_TX) containing only that 4-byte
+// cookie back to the source; a subsequent packet whose first 4 bytes match
+// the cookie whitelists the source immediately (faster than waiting for a
+// second natural retry). Requires ENABLE_UDP_CHALLENGE to also be defined.
+//
+// This does NOT emulate the real game protocol's actual handshake reply --
+// it's a generic 4-byte probe, not a valid RakNet/A2S/TS3/SAMP response.
+// Whether a given game client's network stack does anything useful with an
+// unexpected reply shaped like this (retries in a way that echoes it,
+// ignores it and falls back to its own retry loop, etc.) depends on that
+// client's own implementation and isn't something this firewall can
+// guarantee across every supported game. Where it doesn't help, this
+// degrades gracefully to the same outcome as the passive validator alone
+// (the source still gets whitelisted once it naturally retries within the
+// window) -- it just adds a second, faster path when it does work.
+//#define ENABLE_UDP_ACTIVE_CHALLENGE
+
+// Adds three refinements to new TCP connection (SYN) handling, all sharing
+// one toggle since they're one cohesive unit: (1) weights each SYN's cost
+// against the adaptive rate-limit budget (ENABLE_ADAPTIVE_RATE_LIMIT) by a
+// rough OS plausibility check from TTL/window (a real client's stack is
+// almost always Linux/BSD/macOS- or Windows-shaped; an implausible TTL or
+// a zero window size costs much more of the budget in one hit); (2) a
+// subnet-level (not just per-IP) new-SYN-rate check, catching a botnet
+// spread across many IPs in one block that's each individually under the
+// per-IP budget but adds up in aggregate; (3) rejects a SYN whose total
+// packet size doesn't match any real OS's handshake shape (exactly a bare
+// header with zero TCP options, or much larger than a full realistic
+// option set) before spending any map lookup on it at all. Off by default
+// since the adaptive rate limiter above already provides a flat baseline;
+// this is a sharper tool for a dedicated game/voice server under sustained
+// SYN pressure.
+//#define ENABLE_SYN_PROTECTION
+#ifndef SUBNET_MASK_BITS
+#define SUBNET_MASK_BITS 20 // group source IPs into /20 subnets by default
+#endif
+#ifndef SUBNET_SYN_LIMIT
+#define SUBNET_SYN_LIMIT 500 // new-connection SYNs/sec allowed from one whole subnet
+#endif
+#ifndef SUBNET_MASK_BITS_V6
+#define SUBNET_MASK_BITS_V6 64 // /64 -- standard single-customer IPv6 delegation size;
+                                // MUST be a multiple of 8 (byte-aligned masking only)
+#endif
+
+// Tor relay ORPort connection-flood mitigation, ported from a separate
+// XDP firewall design built specifically for the layer-7 (low-packet-rate,
+// high-connection-count) attacks that have targeted Tor relays. This box
+// running a Tor relay is a deployment choice orthogonal to everything else
+// in this file -- leave undefined unless that's actually what this box is
+// for. See README.md's "Tor relay (ORPort) mitigation" section before
+// enabling: it needs the companion tor-relay-sync.py script kept running
+// to populate the known-relay list from Tor's own consensus.
+//#define ENABLE_TOR_RELAY
+#ifndef TOR_ORPORT
+#define TOR_ORPORT 9001
+#endif
+#ifndef TOR_CONN_LIMIT
+#define TOR_CONN_LIMIT 4 // max simultaneous connections from one non-relay source
+#endif
+#ifndef TOR_RELAY_CONN_LIMIT
+#define TOR_RELAY_CONN_LIMIT 16 // higher cap for known relays -- legitimately share an IP
+#endif
+// A non-relay source is blacklisted for TOR_BLACKLIST_TIME once it opens
+// more than TOR_FAST_LIMIT new connections within TOR_FAST_WINDOW_NS OR
+// more than TOR_SLOW_LIMIT within TOR_SLOW_WINDOW_NS -- the dual window
+// catches both a fast burst and a slower drip that'd otherwise stay under
+// the fast threshold. Known relays are exempt from this blacklist
+// entirely (still capped at TOR_RELAY_CONN_LIMIT concurrent connections).
+#define TOR_FAST_WINDOW_NS 120000000000ULL // 2 minutes
+#ifndef TOR_FAST_LIMIT
+#define TOR_FAST_LIMIT 8
+#endif
+#define TOR_SLOW_WINDOW_NS 3600000000000ULL // 1 hour
+#ifndef TOR_SLOW_LIMIT
+#define TOR_SLOW_LIMIT 16
+#endif
+#ifndef TOR_BLACKLIST_TIME
+#define TOR_BLACKLIST_TIME 86400 // seconds (24h)
+#endif
+
+// Full TCP handshake verification: rejects any non-SYN TCP packet whose
+// flow never had a real SYN -> SYN-ACK -> ACK observed, catching pure
+// ACK-floods that no other check here can see (ENABLE_ADAPTIVE_RATE_LIMIT
+// still rate-limits them, but doesn't verify them). Requires a SECOND
+// attach point beyond the XDP hook -- a TC egress hook (see
+// xdp/prog.c's tcp_egress_track) -- since this box never sends its own
+// SYN-ACKs from the ingress-only XDP program and has no way to observe
+// "did we really reply to this SYN" otherwise. The loader attaches this
+// automatically when built with this flag on (see README.md's "Full TCP
+// handshake verification" section for the exact mechanics and costs):
+// every established-connection packet now costs a map lookup (no longer
+// zero-touch), and any connection already open before this loads has no
+// tracked handshake state and gets rejected as unverified once.
+//#define ENABLE_HANDSHAKE_VERIFY
+#ifndef HANDSHAKE_TIMEOUT_NS
+#define HANDSHAKE_TIMEOUT_NS 10000000000ULL // 10s to complete a TCP handshake once started
 #endif

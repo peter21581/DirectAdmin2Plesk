@@ -1,37 +1,101 @@
+// xdpfw.conf -- see README.md for the full reference. Quick orientation:
+//
+// Always on, zero config needed: bogon filtering, anti-spoofing (bad TCP
+// flags + reflected UDP source ports), UDP amplification protection
+// (with a trusted-DNS/NTP-resolver exemption), ICMP flood protection, and
+// an adaptive per-IP TCP/UDP packet budget that auto-blackholes floods at
+// ANY port -- including ones no rule below covers. Traffic that doesn't
+// match a rule below is allowed by default (there's no need for a
+// catch-all `action = 1` rule).
+//
+// `filters` below is for the two things that need to be *specific*:
+// letting the game/app traffic you actually run through with real
+// payload validation, and applying extra scrutiny (rate limits, IP
+// blocks) beyond the always-on baseline.
+
 verbose = 2;
 log_file = "/var/log/xdpfw.log";
 interface = "ens18";
-update_time = 15;
+pin_maps = true;
+update_time = 15;      // reload this file + re-apply filters every 15s, no restart needed
 no_stats = false;
-stats_per_second = false;
+stats_per_second = true;
 stdout_update_time = 1000;
 
 filters = (
-    {
-        enabled = true,
-        action = 1
-    },
-
-    // Example: `game` alone auto-fills the protocol/port from Rust's
-    // profile (UDP 28015) and only lets the packet through if its payload
-    // actually looks like a real RakNet handshake -- not just anything
-    // aimed at the port. Games with a well-understood handshake (like
-    // this one) also get the spoof-resistant UDP challenge/response
-    // system automatically. See README.md's "The `game` filter option"
-    // for the full list of supported games and their default ports.
+    // --- Game server example ---
+    // `game` alone auto-fills the protocol/port from Rust's profile (UDP
+    // 28015) and requires the payload to actually look like a real RakNet
+    // handshake, not just anything aimed at the port. Rust also gets the
+    // spoof-resistant UDP challenge/response system automatically (see
+    // README.md's "The `game` filter option" for the full profile table).
+    // Uncomment and adjust `game` for whatever you actually run.
     // {
     //     enabled = true,
     //     action = 1,
     //     game = "rust"
-    // }
+    // },
 
-    // Override the default port if your server doesn't use the
-    // conventional one -- any field you set explicitly always wins over
-    // the game's profile default.
+    // A game whose default port doesn't match your deployment: any field
+    // you set explicitly overrides the profile default.
     // {
     //     enabled = true,
     //     action = 1,
     //     udp_dport = 28016,
     //     game = "rust"
+    // },
+
+    // FiveM needs two rules: `game = "fivem"` alone covers its UDP side
+    // (auto-filled to port 30120, RakNet-validated, challenge-protected).
+    // Its separate TCP side (HTTP/NUI/asset streaming) needs its own
+    // plain rule WITHOUT `game` -- FiveM's profile is UDP-only, so tagging
+    // the TCP rule with `game = "fivem"` would require RakNet-shaped
+    // payloads on HTTP traffic and block everything.
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     game = "fivem"
+    // },
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     tcp_enabled = true,
+    //     tcp_dport = "30000-32000"
+    // },
+
+    // --- Generic app example (no `game` -- just header matching) ---
+    // SSH, rate-limited per source flow to blunt brute-force/credential-
+    // stuffing attempts without touching the always-on adaptive budget's
+    // more generous default.
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     tcp_enabled = true,
+    //     tcp_dport = 22,
+    //     flow_pps = 20
+    // },
+
+    // A web server, allowing HTTPS through with its own tighter
+    // connection-rate cap than the global adaptive default.
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     tcp_enabled = true,
+    //     tcp_dport = 443,
+    //     flow_pps = 500
+    // },
+
+    // Explicitly block a specific troublemaker IP outright (prefer
+    // `xdpfw-add -m 2` for this at runtime instead -- see README.md's
+    // xdpfw-add/xdpfw-del section -- this is just what the resulting rule
+    // looks like).
+    // {
+    //     enabled = true,
+    //     action = 0,
+    //     src_ip = "203.0.113.66"
     // }
 );
+
+// Whole CIDR ranges to drop outright (requires ENABLE_IP_RANGE_DROP in
+// config.h, off by default -- see README.md).
+ip_drop_ranges = ( );
