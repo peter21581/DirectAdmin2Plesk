@@ -253,9 +253,9 @@ int main(int argc, char *argv[])
         // without ACK-flood verification on this interface.
         log_msg(&cfg, 2, 0, "Attaching TC egress program (ENABLE_HANDSHAKE_VERIFY) to interface '%s'...", interface);
 
-        if (attach_tc_egress(interface, XDP_OBJ_PATH) != 0)
+        if (attach_tc_egress(prog, interface, if_idx[i]) != 0)
         {
-            log_msg(&cfg, 0, 1, "[WARNING] Failed to attach TC egress program to interface '%s' -- ENABLE_HANDSHAKE_VERIFY will not catch ACK floods on this interface. Is 'tc' (iproute2) installed?\n", interface);
+            log_msg(&cfg, 0, 1, "[WARNING] Failed to attach TC egress program to interface '%s' -- ENABLE_HANDSHAKE_VERIFY will not catch ACK floods on this interface.\n", interface);
         }
         else
         {
@@ -547,7 +547,7 @@ int main(int argc, char *argv[])
         }
 
 #ifdef ENABLE_HANDSHAKE_VERIFY
-        if (detach_tc_egress(interface) != 0)
+        if (detach_tc_egress(interface, if_idx[i]) != 0)
         {
             log_msg(&cfg, 1, 0, "[WARNING] Failed to detach TC egress program from interface '%s' (clsact qdisc may need manual removal: tc qdisc del dev %s clsact).\n", interface, interface);
         }

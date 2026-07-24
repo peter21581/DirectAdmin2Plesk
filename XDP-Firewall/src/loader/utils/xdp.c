@@ -1,9 +1,8 @@
 #include <loader/utils/xdp.h>
 
 #ifdef ENABLE_HANDSHAKE_VERIFY
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/wait.h>
+#include <errno.h>
+#include <bpf/libbpf.h>
 #endif
 
 /**
@@ -802,82 +801,132 @@ void update_range_drops(int map_range_drop, config__t* cfg)
 }
 
 #ifdef ENABLE_HANDSHAKE_VERIFY
-/**
- * Runs a command via fork()+execvp() (never a shell -- argv is passed
- * directly to exec, so there's no injection risk from `interface` even
- * though it comes from config/CLI) and waits for it to finish.
- *
- * @param argv NULL-terminated argument vector (argv[0] is the program name).
- *
- * @return The child's exit code, or -1 on fork/wait failure.
- */
-static int run_cmd(char* const argv[])
+// Tracks which interfaces got the modern TCX (BPF-link) attach below, so
+// detach_tc_egress() knows to tear down via bpf_link__destroy() instead
+// of the classic clsact hook. Interfaces that fall back to the classic
+// method need no stored state -- bpf_tc_hook_destroy() is self-contained,
+// it just needs the ifindex again. MAX_INTERFACES is tiny (see
+// common/config.h), so a linear scan over a plain array is simplest.
+static struct
 {
-    pid_t pid = fork();
+    int ifindex;
+    struct bpf_link* link;
+} tcx_links[MAX_INTERFACES];
 
-    if (pid < 0)
+/**
+ * Attaches the TC egress program (tcp_egress_track, already loaded as
+ * part of the same BPF object as the XDP program -- see xdp/prog.c) for
+ * ENABLE_HANDSHAKE_VERIFY.
+ *
+ * Tries the modern TCX BPF-link hook first (kernel 6.6+): no clsact
+ * qdisc, no separate object load, cleaner multi-program ordering. If the
+ * running kernel doesn't support it -- the common case on older LTS
+ * kernels -- falls back to the classic clsact/netlink attach, also via
+ * libbpf directly. Neither path shells out to the `tc` binary or
+ * requires iproute2 to be installed.
+ *
+ * @param prog The loaded XDP program (its BPF object already contains
+ * the "tc" section program).
+ * @param interface The interface name (used only for log messages by callers).
+ * @param ifindex The interface's index.
+ *
+ * @return 0 on success, non-zero if both methods failed.
+ */
+int attach_tc_egress(struct xdp_program* prog, const char* interface, int ifindex)
+{
+    (void)interface; // kept in the signature for symmetry/log-message use by callers
+
+    struct bpf_object* obj = get_bpf_obj(prog);
+
+    if (obj == NULL)
     {
         return -1;
     }
 
-    if (pid == 0)
-    {
-        // Silence stdout/stderr -- errors here are expected in normal
-        // operation (e.g. "qdisc already exists" on a re-attach).
-        int devnull = open("/dev/null", O_WRONLY);
+    struct bpf_program* tc_prog = bpf_object__find_program_by_name(obj, "tcp_egress_track");
 
-        if (devnull >= 0)
+    if (tc_prog == NULL)
+    {
+        fprintf(stderr, "Error finding 'tcp_egress_track' BPF program.\n");
+
+        return -1;
+    }
+
+#if LIBBPF_MAJOR_VERSION > 1 || (LIBBPF_MAJOR_VERSION == 1 && LIBBPF_MINOR_VERSION >= 2)
+    // Modern path -- only compiled in if the vendored libbpf actually
+    // has bpf_program__attach_tcx() (added in libbpf 1.2). Trying this
+    // first and falling back on failure is more robust than checking
+    // `uname -r` ourselves: some distros backport TCX to older-numbered
+    // kernels, and this way we never have to keep a version table.
+    struct bpf_link* link = bpf_program__attach_tcx(tc_prog, ifindex, NULL);
+
+    if (link != NULL)
+    {
+        for (int i = 0; i < MAX_INTERFACES; i++)
         {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
+            if (tcx_links[i].link == NULL)
+            {
+                tcx_links[i].ifindex = ifindex;
+                tcx_links[i].link = link;
+
+                break;
+            }
         }
 
-        execvp(argv[0], argv);
-        _exit(127); // exec failed
+        return 0;
     }
+    // Fall through to the classic method below -- expected on kernels
+    // older than 6.6, which don't support TCX yet.
+#endif
 
-    int status = 0;
+    LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex, .attach_point = BPF_TC_EGRESS);
 
-    if (waitpid(pid, &status, 0) < 0)
+    int ret = bpf_tc_hook_create(&hook);
+
+    // EEXIST is fine -- the clsact qdisc already exists from a previous run.
+    if (ret != 0 && ret != -EEXIST)
     {
-        return -1;
+        return ret;
     }
 
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    LIBBPF_OPTS(bpf_tc_opts, opts, .prog_fd = bpf_program__fd(tc_prog));
+
+    return bpf_tc_attach(&hook, &opts);
 }
 
 /**
- * Attaches the TC egress program (tcp_egress_track, compiled into the
- * same XDP_OBJ_PATH object) for ENABLE_HANDSHAKE_VERIFY, via the `tc` CLI
- * tool rather than hand-rolled libbpf TC-hook API calls -- this is the
- * exact same mechanism (and command shape) a human operator would use
- * manually, so it's the most predictable option across kernel/iproute2
- * versions. Idempotent: a clsact qdisc that already exists is a harmless
- * no-op (errors from that specific step are ignored).
+ * Detaches the TC egress program from an interface, mirroring whichever
+ * method attach_tc_egress() used for it. A harmless no-op if attach
+ * never succeeded for this interface.
  *
- * @return 0 on success, non-zero on failure to attach the filter itself.
+ * @param interface The interface name (used only for log messages by callers).
+ * @param ifindex The interface's index.
+ *
+ * @return 0 on success, non-zero on failure.
  */
-int attach_tc_egress(const char* interface, const char* obj_path)
+int detach_tc_egress(const char* interface, int ifindex)
 {
-    char* qdisc_argv[] = { "tc", "qdisc", "add", "dev", (char*)interface, "clsact", NULL };
-    run_cmd(qdisc_argv); // ignore result -- "already exists" is expected on re-attach
+    (void)interface;
 
-    char* filter_argv[] = {
-        "tc", "filter", "add", "dev", (char*)interface, "egress",
-        "bpf", "da", "obj", (char*)obj_path, "sec", "tc", NULL
-    };
+    for (int i = 0; i < MAX_INTERFACES; i++)
+    {
+        if (tcx_links[i].link != NULL && tcx_links[i].ifindex == ifindex)
+        {
+            int ret = bpf_link__destroy(tcx_links[i].link);
 
-    return run_cmd(filter_argv);
-}
+            tcx_links[i].link = NULL;
 
-/**
- * Detaches the TC egress program by removing the clsact qdisc (this also
- * removes any filters attached to it, including ours).
- */
-int detach_tc_egress(const char* interface)
-{
-    char* argv[] = { "tc", "qdisc", "del", "dev", (char*)interface, "clsact", NULL };
+            return ret;
+        }
+    }
 
-    return run_cmd(argv);
+    // Wasn't attached via TCX for this interface -- either the classic
+    // clsact method was used, or attach never succeeded. Destroying the
+    // hook removes the whole clsact qdisc (and any filter on it),
+    // matching the old `tc qdisc del dev <if> clsact` behavior. Harmless
+    // if it was never created.
+    LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = ifindex, .attach_point = BPF_TC_EGRESS);
+
+    return bpf_tc_hook_destroy(&hook);
 }
 #endif

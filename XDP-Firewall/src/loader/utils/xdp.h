@@ -39,6 +39,6 @@ int add_range_drop(int map_range_drop, u32 net, u8 cidr);
 void update_range_drops(int map_range_drop, config__t* cfg);
 
 #ifdef ENABLE_HANDSHAKE_VERIFY
-int attach_tc_egress(const char* interface, const char* obj_path);
-int detach_tc_egress(const char* interface);
+int attach_tc_egress(struct xdp_program* prog, const char* interface, int ifindex);
+int detach_tc_egress(const char* interface, int ifindex);
 #endif
