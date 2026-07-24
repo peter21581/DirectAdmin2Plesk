@@ -42,10 +42,12 @@
 //   ENABLE_ADAPTIVE_RATE_LIMIT     per-IP TCP/UDP packet budget, auto-blackhole
 //   ENABLE_SYN_PROTECTION          SYN-flood OS weighting + subnet-level SYN limits
 //   ENABLE_UDP_CHALLENGE           spoof-resistant UDP challenge for `game` rules
+//   ENABLE_IP_RANGE_DROP           lets `ip_drop_ranges` below do something
+//                                  (costs ~nothing when the list is empty)
+//   ENABLE_RL_IP                   per-source-IP (not just flow) pps/bps tracking
+//                                  -- feeds `ip_pps`/`ip_bps` below
 //
 // OFF by default (edit src/common/config.h, uncomment the line, rebuild):
-//   ENABLE_IP_RANGE_DROP           needed for `ip_drop_ranges` below to do anything
-//   ENABLE_RL_IP                   per-source-IP (not just flow) pps/bps tracking
 //   ENABLE_UDP_ACTIVE_CHALLENGE    active cookie-echo variant of the UDP challenge
 //   ENABLE_TOR_RELAY               Tor relay ORPort connection-flood mitigation
 //   ENABLE_HANDSHAKE_VERIFY        full TCP connection state tracking (catches
@@ -130,27 +132,52 @@ filters = (
     //     tcp_dport = "30000-32000"
     // },
 
-    // --- Generic app examples (no `game` -- just header matching) ---
+    // --- Rate-limit examples (no `game` -- just header matching) ---
+    // See README.md's "Fine-tuning rate limits" for the full explanation
+    // of flow_* (one connection) vs ip_* (a whole source IP, every
+    // connection combined). IMPORTANT: a rate-limit field only makes a
+    // rule MATCH once the measured rate EXCEEDS the threshold -- so
+    // action here must be 0 (drop) to actually throttle. action = 1 on a
+    // rule like this would explicitly ALLOW the excess once it's
+    // detected, which isn't what you want.
 
-    // SSH, rate-limited per source flow to blunt brute-force/credential-
-    // stuffing attempts without touching the always-on adaptive budget's
-    // more generous default.
+    // SSH, dropped (and blocked for 5 minutes) per source flow once it
+    // exceeds a rate no real SSH client would ever hit -- blunts brute-
+    // force/credential-stuffing tools without touching the always-on
+    // adaptive budget's more generous default.
     // {
     //     enabled = true,
-    //     action = 1,
+    //     action = 0,
+    //     block_time = 300,
     //     tcp_enabled = true,
     //     tcp_dport = 22,
     //     flow_pps = 20
     // },
 
-    // A web server, allowing HTTPS through with its own tighter
+    // A web server: drop (no block -- a single burst shouldn't blacklist
+    // a real visitor) once one HTTPS connection exceeds a tighter
     // connection-rate cap than the global adaptive default.
     // {
     //     enabled = true,
-    //     action = 1,
+    //     action = 0,
     //     tcp_enabled = true,
     //     tcp_dport = 443,
     //     flow_pps = 500
+    // },
+
+    // A game server: catch a source spread across many UDP flows/ports
+    // that each individually stay under any single flow_pps threshold
+    // but add up to a real flood in aggregate -- requires ENABLE_RL_IP
+    // (on by default). ip_bps also catches a bandwidth-heavy flood using
+    // fewer/larger packets that wouldn't trip ip_pps at all.
+    // {
+    //     enabled = true,
+    //     action = 0,
+    //     block_time = 600,
+    //     udp_enabled = true,
+    //     udp_dport = 28015,
+    //     ip_pps = 5000,
+    //     ip_bps = 10000000
     // },
 
     // Explicitly block a specific troublemaker IP outright. Prefer
@@ -165,8 +192,9 @@ filters = (
     // }
 );
 
-// Whole CIDR ranges to drop outright. Requires ENABLE_IP_RANGE_DROP in
-// src/common/config.h (off by default -- see the cheat sheet above) --
-// entries here are silently ignored otherwise. Prefer `xdpfw-add -m 1`
-// for adding one at runtime instead of editing this list by hand.
+// Whole CIDR ranges to drop outright. Needs ENABLE_IP_RANGE_DROP in
+// src/common/config.h, which is on by default (see the cheat sheet
+// above) -- an empty list here (the default) costs nothing. Prefer
+// `xdpfw-add -m 1` for adding one at runtime instead of editing this
+// list by hand.
 ip_drop_ranges = ( );

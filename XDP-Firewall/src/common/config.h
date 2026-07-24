@@ -4,9 +4,13 @@
 // Disable this for better performance if you only plan on adding entries to the block and drop maps.
 #define ENABLE_FILTERS
 
-// Enables IPv4 range drop map.
-// Disable this if you don't plan on adding IPv4 ranges to the drop map as it will increase performance.
-//#define ENABLE_IP_RANGE_DROP
+// Enables IPv4 range drop map. On by default -- with `ip_drop_ranges`
+// empty (the xdpfw.conf.example default), this costs one bounded LPM-trie
+// lookup per IPv4 packet and finds nothing, so there's no real downside to
+// leaving it on even if you never populate the list. Disable only if you
+// want to shave that one lookup off every packet and are certain you'll
+// never use `ip_drop_ranges`/`xdpfw-add -m 1`.
+#define ENABLE_IP_RANGE_DROP
 
 // The maximum IP ranges supported in the IP range drop map.
 #define MAX_IP_RANGES 4096
@@ -34,10 +38,23 @@
 // Maximum interfaces the firewall can attach to.
 #define MAX_INTERFACES 6
 
-// NOTE - If you're receiving a high volume of spoofed packets, it is recommended you disable rate limiting below.
-// This is because the PPS/BPS counters are updated for every packet and with a spoofed attack, the LRU map will recycle a lot of entries resulting in additional load on the CPU.
-// Enable source IP rate limiting.
-//#define ENABLE_RL_IP
+// NOTE - this and every other LRU-hash-based tracking in this file
+// (ENABLE_RL_FLOW below, ENABLE_ADAPTIVE_RATE_LIMIT, ENABLE_ICMP_PROTECTION
+// in the section further down) share the same real caveat: under a heavy
+// *spoofed*-source flood (many fake, effectively-random source IPs), every
+// packet looks like a "new" entry, so the LRU map recycles constantly --
+// that's extra CPU load precisely while you're already under attack. If
+// you're seeing that specific pattern, it's worth turning some of these off
+// temporarily rather than reflexively leaving everything on. Ordinary
+// (non-spoofed, or moderately-spoofed) traffic doesn't trigger this.
+//
+// Enable source IP rate limiting -- on by default. This is what feeds
+// `ip_pps`/`ip_bps` in a filter rule (see xdpfw.conf.example): aggregate
+// packet/byte rate across an entire source IP's whole connection set, not
+// just one flow. ENABLE_RL_FLOW below and ENABLE_ADAPTIVE_RATE_LIMIT further
+// down don't give you this specifically -- flow-based is per-connection,
+// and the adaptive limiter only counts packets, not bytes.
+#define ENABLE_RL_IP
 
 // Enable source flow rate limiting.
 #define ENABLE_RL_FLOW

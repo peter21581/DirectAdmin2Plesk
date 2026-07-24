@@ -44,7 +44,7 @@ All features can be enabled or disabled through the build-time configuration ([`
 ### 🌍 IP Range Dropping (CIDR)
 * Block entire **IP subnets** efficiently at the XDP level.
 * Supports **CIDR-based filtering** (e.g., `192.168.1.0/24`).
-* Disabled by default but can be enabled in [`config.h`](./src/common/config.h).
+* **On by default** (`ENABLE_IP_RANGE_DROP` in [`config.h`](./src/common/config.h)) -- with `ip_drop_ranges` empty (the default), this costs one bounded lookup per IPv4 packet and finds nothing, so there's no real downside to leaving it on even before you've added anything to the list.
 
 ### 📊 Real-Time Packet Counters
 * Track **allowed, dropped, and passed** packets in real time.
@@ -376,6 +376,50 @@ filters = (
 ip_drop_ranges = ( "192.168.1.0/24", "10.3.0.0/24" );
 ```
 
+## 🎚️ Fine-tuning rate limits
+Four fields, two independent axes -- **what** you're measuring (packets vs. bytes) and **how wide** the net is (one connection vs. a whole source IP):
+
+| Field | Measures | Scope |
+| ---- | ---- | ---- |
+| `flow_pps` | packets/sec | one flow (source IP **+ port**) |
+| `flow_bps` | bytes/sec | one flow |
+| `ip_pps` | packets/sec | the whole source IP, every port/connection combined |
+| `ip_bps` | bytes/sec | the whole source IP, every port/connection combined |
+
+All four need `ENABLE_RL_FLOW`/`ENABLE_RL_IP` in `config.h` (both on by default) and only apply to a rule where you've actually set them -- a rule with none of the four set never touches the rate-limit maps at all.
+
+**Reach for `flow_*`** when you care about one connection behaving badly -- a single client hammering your SSH port, a single game connection sending garbage faster than any real client would:
+```squidconf
+{
+    enabled = true,
+    action = 0,           // drop and block (see block_time below) once tripped
+    block_time = 300,      // 5 minutes
+
+    tcp_enabled = true,
+    tcp_dport = 22,
+    flow_pps = 30          // a real SSH client never sends 30 packets/sec
+}
+```
+
+**Reach for `ip_*`** when you care about a source's *aggregate* behavior across many connections -- a source spread across dozens of ports/flows, each individually under any single `flow_pps` threshold, that still adds up to a real flood:
+```squidconf
+{
+    enabled = true,
+    action = 0,
+    block_time = 600,
+
+    udp_enabled = true,
+    udp_dport = 28015,     // your game port
+    ip_pps = 5000,          // aggregate packets/sec from one source IP, any port
+    ip_bps = 10000000       // ~10 MB/s -- catches a bandwidth-heavy flood using
+                             // fewer/larger packets that wouldn't trip ip_pps
+}
+```
+
+You can combine multiple fields on one rule (all of them must be exceeded for the rule to match -- see the Filter Object notes above) and combine `game`/payload validation with a rate limit on the same rule: a `game = "rust"` rule that *also* sets `flow_pps` gets both the payload check and a per-connection cap.
+
+**Picking numbers**: there's no universal right answer -- it depends on your game/app's real traffic pattern and player count. Start generous (you want real players to never trip it) and tighten based on what `stats_per_second = true` shows you during a quiet period vs. what you see during an actual attack. `xdpfw -l` prints the resolved value of every field in every active rule if you want to sanity-check what's actually configured.
+
 ## 🔧 The `xdpfw-add` & `xdpfw-del` Utilities
 When the main BPF maps are pinned to the file system (depending on the `pin_maps` runtime option detailed above), this allows you to add or delete rules while the firewall is running using the `xdpfw-add` and `xdpfw-del` utilities.
 
@@ -481,11 +525,9 @@ Unfortunately, we can't really eliminate the `for` loop with the current amount 
 The firewall is still decent at filtering non-spoofed attacks, especially when a block time is specified so that malicious IPs are filtered at the beginning of the program for some time.
 
 ### Rate Limiting
-This firewall supports both source **flow-based** (`flow_pps` and `flow_bps` settings) and **IP-based** (`ip_pps` and `ip_bps` settings) rate limiting. However, source IP-based rate limiting is disabled by default and can be enabled inside of the [`config.h`](https://github.com/gamemann/XDP-Firewall/blob/master/src/common/config.h#L40) file.
+This firewall supports both source **flow-based** (`flow_pps`/`flow_bps` -- one connection: source IP + port) and **IP-based** (`ip_pps`/`ip_bps` -- a whole source IP's entire connection set combined) rate limiting, both on by default (`ENABLE_RL_FLOW`/`ENABLE_RL_IP` in [`config.h`](./src/common/config.h)). Use `flow_*` to cap any single connection (e.g. one abusive client), and `ip_*` to catch a source spreading load across many connections/ports to stay under any single flow's threshold. See [Fine-tuning rate limits](#-fine-tuning-rate-limits) below for concrete examples of when to reach for which.
 
-The reason source IP-based rate limiting is disabled by default is because both methods require seperate calculations which isn't ideal if both methods aren't used inside of filter rules. I've found most users prefer flow-based rate limiting which is why I decided to only enable that by default.
-
-Additionally, if you're encountering a large amount of spoofed packets, it is **highly recommended** that you disable rate limiting entirely, at least temporarily until you stop receiving the spoofed packets. This is because a large amount of spoofed packets from different IPs and ports will cause the rate limit BPF maps to rapidly recycle entries and this can cause very high CPU usage depending on how many spoofed packets are being sent and the host's hardware.
+If you're encountering a large amount of **spoofed** packets specifically, it's worth temporarily disabling rate limiting (`ENABLE_RL_FLOW`/`ENABLE_RL_IP`, and for that matter `ENABLE_ADAPTIVE_RATE_LIMIT`/`ENABLE_ICMP_PROTECTION`) until it stops. All of these are backed by LRU-hash maps, and a flood of packets from effectively-random spoofed source IPs makes every packet look like a "new" entry -- the map recycles constantly, which costs real CPU precisely while you're already under attack. Ordinary (non-spoofed, or moderately-spoofed) traffic doesn't trigger this.
 
 ### Filter Logging
 This tool uses `bpf_ringbuf_reserve()` and `bpf_ringbuf_submit()` for filter match logging. At this time, there is no rate limit for the amount of log messages that may be sent. Therefore, if you're encountering a spoofed attack that is matching a filter rule with logging enabled, it will cause additional processing and disk load.
