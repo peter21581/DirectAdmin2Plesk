@@ -190,11 +190,14 @@
 // per-IP budget but adds up in aggregate; (3) rejects a SYN whose total
 // packet size doesn't match any real OS's handshake shape (exactly a bare
 // header with zero TCP options, or much larger than a full realistic
-// option set) before spending any map lookup on it at all. Off by default
-// since the adaptive rate limiter above already provides a flat baseline;
-// this is a sharper tool for a dedicated game/voice server under sustained
-// SYN pressure.
-//#define ENABLE_SYN_PROTECTION
+// option set) before spending any map lookup on it at all. On by default --
+// every part of this is either header-only (no map access) or a single
+// low-frequency map touch (SYNs are a small fraction of total traffic
+// compared to established data), and all three were unconditional/always-on
+// in the original design this was ported from. Turn it off if you want the
+// adaptive rate limiter's flat per-packet budget to be the only thing
+// governing new connections.
+#define ENABLE_SYN_PROTECTION
 #ifndef SUBNET_MASK_BITS
 #define SUBNET_MASK_BITS 20 // group source IPs into /20 subnets by default
 #endif

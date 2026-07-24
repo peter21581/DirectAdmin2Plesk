@@ -40,13 +40,13 @@
 //   ENABLE_BAD_PAYLOAD_FILTER      drop known flood-tool payload signatures
 //   ENABLE_ICMP_PROTECTION         per-IP ICMP flood budget
 //   ENABLE_ADAPTIVE_RATE_LIMIT     per-IP TCP/UDP packet budget, auto-blackhole
+//   ENABLE_SYN_PROTECTION          SYN-flood OS weighting + subnet-level SYN limits
 //   ENABLE_UDP_CHALLENGE           spoof-resistant UDP challenge for `game` rules
 //
 // OFF by default (edit src/common/config.h, uncomment the line, rebuild):
 //   ENABLE_IP_RANGE_DROP           needed for `ip_drop_ranges` below to do anything
 //   ENABLE_RL_IP                   per-source-IP (not just flow) pps/bps tracking
 //   ENABLE_UDP_ACTIVE_CHALLENGE    active cookie-echo variant of the UDP challenge
-//   ENABLE_SYN_PROTECTION          SYN-flood OS weighting + subnet-level SYN limits
 //   ENABLE_TOR_RELAY               Tor relay ORPort connection-flood mitigation
 //   ENABLE_HANDSHAKE_VERIFY        full TCP connection state tracking (catches
 //                                  ACK/RST/FIN floods) -- needs a 2nd attach
@@ -100,10 +100,12 @@ filters = (
     // },
 
     // TeamSpeak 3: this is literally all it takes. `game = "ts3"`
-    // auto-fills UDP 9987 (the conventional default -- override with
-    // udp_dport if yours differs) and validates the payload against
-    // TS3's real "TS3INIT1" handshake preamble, with the spoof-resistant
-    // challenge system layered on top automatically.
+    // auto-fills UDP 9000-10500 (covers the conventional single-instance
+    // default of 9987 plus the range real TS3 hosting uses for multiple
+    // virtual server instances -- override with udp_dport if yours is
+    // narrower/different) and validates the payload against TS3's real
+    // "TS3INIT1" handshake preamble, with the spoof-resistant challenge
+    // system layered on top automatically.
     // {
     //     enabled = true,
     //     action = 1,
