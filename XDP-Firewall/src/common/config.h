@@ -242,20 +242,34 @@
 #define TOR_BLACKLIST_TIME 86400 // seconds (24h)
 #endif
 
-// Full TCP handshake verification: rejects any non-SYN TCP packet whose
-// flow never had a real SYN -> SYN-ACK -> ACK observed, catching pure
-// ACK-floods that no other check here can see (ENABLE_ADAPTIVE_RATE_LIMIT
-// still rate-limits them, but doesn't verify them). Requires a SECOND
-// attach point beyond the XDP hook -- a TC egress hook (see
-// xdp/prog.c's tcp_egress_track) -- since this box never sends its own
-// SYN-ACKs from the ingress-only XDP program and has no way to observe
-// "did we really reply to this SYN" otherwise. The loader attaches this
-// automatically when built with this flag on (see README.md's "Full TCP
-// handshake verification" section for the exact mechanics and costs):
-// every established-connection packet now costs a map lookup (no longer
-// zero-touch), and any connection already open before this loads has no
-// tracked handshake state and gets rejected as unverified once.
+// Full TCP connection state tracking: a small state machine (see
+// common/types.h's TCP_TRACK_* / tcp_flow_state_t and xdp/prog.c's
+// comments for the exact transition rules) that rejects any packet that
+// doesn't belong to a real, currently-tracked connection at the right
+// point in its lifecycle -- not just "was there ever a SYN" (that alone
+// only catches pure ACK-floods): a spoofed FIN/RST flood aimed at killing
+// real connections, or an ACK arriving before the handshake it claims to
+// belong to ever completed, get rejected too. This is deliberately NOT a
+// full RFC 793 implementation (11 states, sequence-number tracking,
+// retransmission handling) -- that's the kernel conntrack's job for
+// traffic that reaches it; this only needs enough state to tell "does
+// this packet belong to a real tracked connection," which is what
+// actually matters for DDoS mitigation here.
+//
+// Requires a SECOND attach point beyond the XDP hook -- a TC egress hook
+// (see xdp/prog.c's tcp_egress_track) -- since this box never sends its
+// own SYN-ACKs from the ingress-only XDP program and has no way to
+// observe "did we really reply to this SYN" otherwise. The loader
+// attaches this automatically when built with this flag on (see
+// README.md's "Full TCP connection state tracking" section for the exact
+// mechanics and costs): every established-connection packet now costs a
+// map lookup (no longer zero-touch), and any connection already open
+// before this loads has no tracked state and gets rejected as unverified
+// until it opens a new one.
 //#define ENABLE_HANDSHAKE_VERIFY
 #ifndef HANDSHAKE_TIMEOUT_NS
 #define HANDSHAKE_TIMEOUT_NS 10000000000ULL // 10s to complete a TCP handshake once started
+#endif
+#ifndef TCP_CLOSE_GRACE_NS
+#define TCP_CLOSE_GRACE_NS 10000000000ULL // 10s to finish a close sequence (FIN/FIN-ACK/ACK) once started
 #endif

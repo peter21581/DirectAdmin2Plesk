@@ -1,17 +1,60 @@
-// xdpfw.conf -- see README.md for the full reference. Quick orientation:
+// xdpfw.conf -- runtime configuration. Reloaded automatically every
+// `update_time` seconds (see below) -- no restart needed for anything in
+// this file. Full reference: README.md.
 //
-// Always on, zero config needed: bogon filtering, anti-spoofing (bad TCP
-// flags + reflected UDP source ports), UDP amplification protection
-// (with a trusted-DNS/NTP-resolver exemption), ICMP flood protection, and
-// an adaptive per-IP TCP/UDP packet budget that auto-blackholes floods at
-// ANY port -- including ones no rule below covers. Traffic that doesn't
-// match a rule below is allowed by default (there's no need for a
-// catch-all `action = 1` rule).
+// ============================================================================
+// TWO CONFIG TIERS -- READ THIS FIRST
+// ============================================================================
+// This firewall has two separate places settings live, and they work very
+// differently:
 //
-// `filters` below is for the two things that need to be *specific*:
-// letting the game/app traffic you actually run through with real
-// payload validation, and applying extra scrutiny (rate limits, IP
-// blocks) beyond the always-on baseline.
+//   1. THIS FILE (xdpfw.conf) -- runtime settings. Everything below this
+//      comment block. Edit and save; the running firewall picks it up on
+//      its own within `update_time` seconds (or instantly via `xdpfw-add`/
+//      `xdpfw-del`, or `systemctl reload xdpfw`). No rebuild, no restart.
+//
+//   2. src/common/config.h -- compile-time settings. A handful of advanced
+//      protections are OFF by default here and need you to uncomment a
+//      `#define` line and rebuild (`make && sudo make install && sudo
+//      systemctl restart xdpfw`) to turn on. You will never see these by
+//      editing this file -- there is no runtime equivalent, on purpose,
+//      since each one changes the shape of the compiled BPF program.
+//
+// You don't need to touch config.h at all for normal use -- bogon
+// filtering, anti-spoofing, amplification protection, ICMP flood
+// protection, and the adaptive packet budget are ALL already on by
+// default and need zero configuration anywhere. config.h only matters if
+// you want one of the features in the cheat sheet below.
+//
+// ----------------------------------------------------------------------------
+// config.h cheat sheet -- what's on by default, and how to turn on what isn't
+// ----------------------------------------------------------------------------
+// ON by default, no action needed:
+//   ENABLE_FILTERS               the `filters` list below actually works
+//   ENABLE_IPV6                  IPv6 support throughout
+//   ENABLE_RL_FLOW                per-source-flow pps/bps tracking (feeds
+//                                 into `flow_pps`/`flow_bps` below)
+//   ENABLE_BOGON_FILTER           drop RFC1918/loopback/etc. spoofed sources
+//   ENABLE_ANTI_SPOOF              drop bad TCP flags + reflected UDP sources
+//   ENABLE_AMP_PROTECTION          drop oversized DNS/NTP/memcached/etc. floods
+//   ENABLE_BAD_PAYLOAD_FILTER      drop known flood-tool payload signatures
+//   ENABLE_ICMP_PROTECTION         per-IP ICMP flood budget
+//   ENABLE_ADAPTIVE_RATE_LIMIT     per-IP TCP/UDP packet budget, auto-blackhole
+//   ENABLE_UDP_CHALLENGE           spoof-resistant UDP challenge for `game` rules
+//
+// OFF by default (edit src/common/config.h, uncomment the line, rebuild):
+//   ENABLE_IP_RANGE_DROP           needed for `ip_drop_ranges` below to do anything
+//   ENABLE_RL_IP                   per-source-IP (not just flow) pps/bps tracking
+//   ENABLE_UDP_ACTIVE_CHALLENGE    active cookie-echo variant of the UDP challenge
+//   ENABLE_SYN_PROTECTION          SYN-flood OS weighting + subnet-level SYN limits
+//   ENABLE_TOR_RELAY               Tor relay ORPort connection-flood mitigation
+//   ENABLE_HANDSHAKE_VERIFY        full TCP connection state tracking (catches
+//                                  ACK/RST/FIN floods) -- needs a 2nd attach
+//                                  point, see README.md before turning this on
+//
+// Each flag's own comment in config.h explains what it does and what it
+// costs in more detail than fits here -- read it before flipping one on.
+// ============================================================================
 
 verbose = 2;
 log_file = "/var/log/xdpfw.log";
@@ -22,27 +65,49 @@ no_stats = false;
 stats_per_second = true;
 stdout_update_time = 1000;
 
+// ============================================================================
+// FILTERS -- everything below is optional. With an empty list (the
+// default), you already get the always-on protection described above on
+// every port. Add a rule here only when you want to:
+//   (a) validate a specific game/app's traffic (payload signatures,
+//       auto-filled ports, spoof-resistant challenges), or
+//   (b) apply extra scrutiny (a tighter rate limit, an outright IP block)
+//       beyond the always-on baseline.
+// ============================================================================
 filters = (
-    // --- Game server example ---
-    // `game` alone auto-fills the protocol/port from Rust's profile (UDP
-    // 28015) and requires the payload to actually look like a real RakNet
-    // handshake, not just anything aimed at the port. Rust also gets the
-    // spoof-resistant UDP challenge/response system automatically (see
-    // README.md's "The `game` filter option" for the full profile table).
-    // Uncomment and adjust `game` for whatever you actually run.
+    // --- Game server examples ---
+
+    // Rust: `game` alone auto-fills the protocol/port from Rust's profile
+    // (UDP 28015) and requires the payload to actually look like a real
+    // RakNet handshake (or a bare Source-engine-style query), not just
+    // anything aimed at the port. Also gets the spoof-resistant UDP
+    // challenge/response system automatically. See README.md's "The
+    // `game` filter option" for the full profile table (16 supported
+    // games) and which ones get the challenge system.
     // {
     //     enabled = true,
     //     action = 1,
     //     game = "rust"
     // },
 
-    // A game whose default port doesn't match your deployment: any field
-    // you set explicitly overrides the profile default.
+    // Same game, but your server doesn't use the conventional port: any
+    // field you set explicitly always overrides the profile default.
     // {
     //     enabled = true,
     //     action = 1,
     //     udp_dport = 28016,
     //     game = "rust"
+    // },
+
+    // TeamSpeak 3: this is literally all it takes. `game = "ts3"`
+    // auto-fills UDP 9987 (the conventional default -- override with
+    // udp_dport if yours differs) and validates the payload against
+    // TS3's real "TS3INIT1" handshake preamble, with the spoof-resistant
+    // challenge system layered on top automatically.
+    // {
+    //     enabled = true,
+    //     action = 1,
+    //     game = "ts3"
     // },
 
     // FiveM needs two rules: `game = "fivem"` alone covers its UDP side
@@ -63,7 +128,8 @@ filters = (
     //     tcp_dport = "30000-32000"
     // },
 
-    // --- Generic app example (no `game` -- just header matching) ---
+    // --- Generic app examples (no `game` -- just header matching) ---
+
     // SSH, rate-limited per source flow to blunt brute-force/credential-
     // stuffing attempts without touching the always-on adaptive budget's
     // more generous default.
@@ -85,10 +151,11 @@ filters = (
     //     flow_pps = 500
     // },
 
-    // Explicitly block a specific troublemaker IP outright (prefer
-    // `xdpfw-add -m 2` for this at runtime instead -- see README.md's
-    // xdpfw-add/xdpfw-del section -- this is just what the resulting rule
-    // looks like).
+    // Explicitly block a specific troublemaker IP outright. Prefer
+    // `xdpfw-add -m 2 -d 203.0.113.66 -e 3600` for this at runtime
+    // instead (no config edit/reload needed, and supports an expiry) --
+    // see README.md's xdpfw-add/xdpfw-del section. This is just what the
+    // equivalent rule looks like written directly in this file.
     // {
     //     enabled = true,
     //     action = 0,
@@ -96,6 +163,8 @@ filters = (
     // }
 );
 
-// Whole CIDR ranges to drop outright (requires ENABLE_IP_RANGE_DROP in
-// config.h, off by default -- see README.md).
+// Whole CIDR ranges to drop outright. Requires ENABLE_IP_RANGE_DROP in
+// src/common/config.h (off by default -- see the cheat sheet above) --
+// entries here are silently ignored otherwise. Prefer `xdpfw-add -m 1`
+// for adding one at runtime instead of editing this list by hand.
 ip_drop_ranges = ( );

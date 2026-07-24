@@ -240,7 +240,7 @@ int xdp_prog_main(struct xdp_md *ctx)
 #endif
 
 #ifdef ENABLE_HANDSHAKE_VERIFY
-                // Full handshake verification -- see config.h's
+                // Full TCP connection state tracking -- see config.h's
                 // ENABLE_HANDSHAKE_VERIFY comment and README.md's matching
                 // section before enabling this. Framed from the peer's
                 // point of view (see tcp_flow_key_t's comment): on
@@ -252,11 +252,43 @@ int xdp_prog_main(struct xdp_md *ctx)
                         .local_port = ntohs(tcph->dest)
                     };
 
-                    if (tcph->fin || tcph->rst)
+                    tcp_flow_state_t *hs = bpf_map_lookup_elem(&map_tcp_handshake, &hs_key);
+
+                    if (tcph->rst)
                     {
-                        // Connection closing -- stop tracking it either
-                        // way, whether it was ever established or not.
+                        // A real RST only ever belongs to a flow we're
+                        // already tracking in some state -- one arriving
+                        // for a completely untracked flow is either stray
+                        // noise (nothing was relying on it anyway) or a
+                        // spoofed RST-flood aimed at killing real
+                        // connections. Drop it either way.
+                        if (!hs)
+                        {
+                            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                            return XDP_DROP;
+                        }
+
                         bpf_map_delete_elem(&map_tcp_handshake, &hs_key);
+                    }
+                    else if (tcph->fin)
+                    {
+                        // Same reasoning as RST above for an untracked
+                        // flow. A tracked flow (any state) moves to
+                        // CLOSING and gets a grace window for the rest of
+                        // the close sequence (FIN-ACK, final ACK) rather
+                        // than being evicted immediately -- evicting on
+                        // the first FIN would reject that tail end as
+                        // unverified.
+                        if (!hs)
+                        {
+                            inc_pkt_stats(stats, STATS_TYPE_DROPPED);
+
+                            return XDP_DROP;
+                        }
+
+                        hs->state = TCP_TRACK_CLOSING;
+                        hs->ts = now;
                     }
                     else if (tcph->syn && !tcph->ack)
                     {
@@ -270,27 +302,32 @@ int xdp_prog_main(struct xdp_md *ctx)
                     else
                     {
                         // Either a SYN-ACK arriving inbound (we'd be the
-                        // client) or a non-SYN packet (established data,
-                        // or the client's final handshake ACK).
-                        tcp_flow_state_t *hs = bpf_map_lookup_elem(&map_tcp_handshake, &hs_key);
+                        // client), the client's final handshake ACK, or a
+                        // plain established-connection data/ACK packet --
+                        // valid only if it belongs to a flow we're
+                        // already tracking, at the right point in its
+                        // lifecycle.
+                        int valid = hs && (
+                            hs->state == TCP_TRACK_ESTABLISHED ||
+                            (hs->state == TCP_TRACK_PENDING && now - hs->ts < HANDSHAKE_TIMEOUT_NS) ||
+                            (hs->state == TCP_TRACK_CLOSING && now - hs->ts < TCP_CLOSE_GRACE_NS)
+                        );
 
-                        if (hs && (hs->established || now - hs->ts < HANDSHAKE_TIMEOUT_NS))
+                        if (!valid)
                         {
-                            if (!hs->established)
-                            {
-                                hs->established = 1;
-                                hs->ts = now;
-                            }
-                        }
-                        else
-                        {
-                            // No matching handshake ever observed for
+                            // No matching connection ever observed for
                             // this flow (or it timed out) -- exactly the
                             // pure-ACK-flood / unsolicited SYN-ACK shape
                             // this feature exists to catch.
                             inc_pkt_stats(stats, STATS_TYPE_DROPPED);
 
                             return XDP_DROP;
+                        }
+
+                        if (hs->state == TCP_TRACK_PENDING)
+                        {
+                            hs->state = TCP_TRACK_ESTABLISHED;
+                            hs->ts = now;
                         }
                     }
                 }
@@ -929,9 +966,27 @@ int tcp_egress_track(struct __sk_buff *skb)
         .local_port = ntohs(tcp->source)
     };
 
-    if (tcp->fin || tcp->rst)
+    if (tcp->rst)
     {
         bpf_map_delete_elem(&map_tcp_handshake, &key);
+
+        return TC_ACT_OK;
+    }
+
+    if (tcp->fin)
+    {
+        // Mirrors the ingress side: move to CLOSING (grace window for
+        // the rest of the close sequence) rather than deleting outright.
+        // Our own outbound FIN always belongs to a flow we're already
+        // tracking in some state -- if not (e.g. a connection open
+        // before this program attached), there's nothing to update.
+        tcp_flow_state_t *hs = bpf_map_lookup_elem(&map_tcp_handshake, &key);
+
+        if (hs)
+        {
+            hs->state = TCP_TRACK_CLOSING;
+            hs->ts = bpf_ktime_get_ns();
+        }
 
         return TC_ACT_OK;
     }
@@ -941,7 +996,7 @@ int tcp_egress_track(struct __sk_buff *skb)
     // ingress) starts a new pending handshake.
     if (tcp->syn)
     {
-        tcp_flow_state_t st = { .established = 0, .ts = bpf_ktime_get_ns() };
+        tcp_flow_state_t st = { .state = TCP_TRACK_PENDING, .ts = bpf_ktime_get_ns() };
         bpf_map_update_elem(&map_tcp_handshake, &key, &st, BPF_ANY);
     }
 

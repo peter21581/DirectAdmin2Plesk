@@ -254,11 +254,19 @@ struct tcp_flow_key
     u16 local_port;
 } typedef tcp_flow_key_t;
 
-// established=0 means "a handshake packet was sent, waiting for the
-// peer's next expected packet" (not yet trusted). established=1 means a
-// real handshake actually completed.
+// ENABLE_HANDSHAKE_VERIFY's per-flow state -- enough to validate a
+// connection's lifecycle without reimplementing RFC 793 in full (that's
+// the kernel conntrack's job for packets that reach it; this only needs
+// to answer "does this packet belong to a real, currently-tracked
+// connection"). See xdp/prog.c's tcp_track_state enum and comments for
+// the transition rules.
+#define TCP_TRACK_PENDING 0     // handshake started (SYN sent our way, or by us) -- not yet trusted
+#define TCP_TRACK_ESTABLISHED 1 // handshake completed
+#define TCP_TRACK_CLOSING 2     // a FIN was seen from either side -- still tracked for the rest
+                                 // of the close sequence, not yet trusted to re-open
+
 struct tcp_flow_state
 {
-    u8 established;
-    u64 ts; // last transition, used to time out a stuck pending handshake
+    u8 state;
+    u64 ts; // last transition, used to time out a stuck pending handshake or finish a stale close
 } typedef tcp_flow_state_t;

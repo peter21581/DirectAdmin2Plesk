@@ -77,6 +77,7 @@ All features can be enabled or disabled through the build-time configuration ([`
 * **ICMP flood protection** — a weighted per-source-IP packet budget (echo requests cost less than rarer, more-often-abusive ICMP types).
 * **Adaptive TCP/UDP packet budget** — a 1-second rolling per-source-IP packet count across all TCP/UDP traffic; exceeding it auto-blackholes the source into the same block map a filter rule's own `block_time` uses. Closes the gap the checks above don't: a flood that doesn't match any specific signature and hits a port no `filters` rule covers (including a pure TCP ACK flood). Known DNS/NTP resolvers are exempt.
 * All toggle independently in [`config.h`](./src/common/config.h) (`ENABLE_BOGON_FILTER`, `ENABLE_ANTI_SPOOF`, `ENABLE_AMP_PROTECTION`, `ENABLE_BAD_PAYLOAD_FILTER`, `ENABLE_ICMP_PROTECTION`, `ENABLE_ADAPTIVE_RATE_LIMIT`) — **all on by default**, no `filters` rule required, and **independent of `ENABLE_FILTERS`** too: even if you compile out dynamic filter rules entirely for a minimal block-map-only build, these core protections still run. Only game/app-specific matching needs an explicit rule (and needs `ENABLE_FILTERS`, since it's implemented as a filter rule option).
+* **On "zero added latency" for established connections**: not strictly true once `ENABLE_ADAPTIVE_RATE_LIMIT`/`ENABLE_ICMP_PROTECTION` are on (the default) — each does one LRU-hash lookup+write per packet, including already-established ones. It wasn't strictly zero-touch upstream either (`ENABLE_RL_FLOW`, on by default, already did the same for its own flow-stats map). In absolute terms this is a handful of nanoseconds, not something that shows up as perceptible latency — but if you want the old zero-touch-for-established behavior back for a max-throughput box, turn `ENABLE_ADAPTIVE_RATE_LIMIT` and `ENABLE_ICMP_PROTECTION` off and rely on bogon/anti-spoof/amp (all header/payload-only, no map access) plus your own `filters` rules instead.
 
 ## 🛠️ Building & Installing
 Before building, ensure the following packages are installed. These packages can be installed with `apt` on Debian-based systems (e.g. Ubuntu, etc.), but there should be similar names in other package managers.
@@ -571,10 +572,23 @@ python3 tor-relay-sync.py --tor-user debian-tor --consensus /var/lib/tor/cached-
 
 Same privilege-separation reasoning as the original design this was ported from: the consensus file's content is attacker-influenceable, so the actual parsing runs as the unprivileged Tor user (`runuser`), not as root — only the result, re-validated as well-formed IPs, reaches the privileged `bpftool` calls (against the pinned `map_tor_known_relays`/`map_tor_known_relays6` maps). This is deployment-specific — only turn it on if this box actually runs a Tor relay.
 
-#### `ENABLE_HANDSHAKE_VERIFY`
-Rejects any non-SYN TCP packet whose flow never had a real SYN → SYN-ACK → ACK observed, catching pure ACK-floods that nothing else here can see (`ENABLE_ADAPTIVE_RATE_LIMIT` still rate-limits them, but doesn't verify them). IPv4 only. Needs a second attach point beyond the XDP hook: a **TC egress hook** (`tcp_egress_track`, compiled into the same `xdp_prog.o`), since this program never sends its own SYN-ACKs from the ingress-only XDP side and has no other way to observe "did we really reply to this SYN". The loader attaches/detaches this automatically (via the standard `tc qdisc`/`tc filter` commands, run through `execvp` — never a shell, so there's no injection risk from the interface name) whenever built with this flag on; a failed TC attach is a warning, not fatal (the XDP program and every other protection stay up regardless).
+#### `ENABLE_HANDSHAKE_VERIFY` — full TCP connection state tracking
+Goes beyond "was there ever a SYN": a small per-flow state machine (`TCP_TRACK_PENDING` → `TCP_TRACK_ESTABLISHED` → `TCP_TRACK_CLOSING`, see `common/types.h`) that only accepts a packet if it belongs to a real, currently-tracked connection at the right point in its lifecycle. This catches more than a pure ACK-flood:
 
-Real costs, same as the design this was ported from: every established-connection packet now costs a map lookup (no longer zero-touch), and any connection already open before this loads has no tracked handshake state and gets rejected once as unverified.
+| Attack shape | Caught because... |
+| ---- | ---- |
+| Pure ACK-flood (no real handshake ever happened) | no tracked flow exists for that peer/port pair at all |
+| Spoofed RST-flood aimed at killing real connections | an RST for a flow with no tracked state is dropped outright — a real RST always belongs to a connection this box already knows about |
+| Spoofed FIN-flood | same reasoning as RST |
+| A data/ACK packet arriving before its handshake actually completed | `PENDING` only accepts the completing packet within `HANDSHAKE_TIMEOUT_NS` (10s default) |
+
+A real FIN moves a tracked flow to `TCP_TRACK_CLOSING` instead of untracking it immediately — the rest of a legitimate close sequence (FIN-ACK, final ACK) still needs to pass, and evicting on the first FIN would reject that tail end as "unverified". `TCP_CLOSE_GRACE_NS` (10s default) bounds how long a flow stays in `CLOSING` before it's no longer trusted.
+
+This is deliberately **not** a full RFC 793 implementation (11 states, sequence-number tracking, retransmission handling) — that's the kernel conntrack's job for traffic that reaches it. It only tracks enough to answer "does this packet belong to a real connection", which is what matters for DDoS mitigation here.
+
+IPv4 only. Needs a second attach point beyond the XDP hook: a **TC egress hook** (`tcp_egress_track`, compiled into the same `xdp_prog.o`), since this program never sends its own SYN-ACKs from the ingress-only XDP side and has no other way to observe "did we really reply to this SYN". The loader attaches/detaches this automatically (via the standard `tc qdisc`/`tc filter` commands, run through `execvp` — never a shell, so there's no injection risk from the interface name) whenever built with this flag on; a failed TC attach is a warning, not fatal (the XDP program and every other protection stay up regardless).
+
+Real costs, same as the design this was ported from: every established-connection packet now costs a map lookup (no longer zero-touch), and any connection already open before this loads has no tracked state and gets rejected until it opens a new one.
 
 ## 🔀 Merge notes: what's still not carried over
 * **`monitor.py`'s TUI dashboard and Prometheus exporter.** This engine's loader already prints live stats to stdout and every protection in this merge shows up in the same `map_stats` counters, but there's no live curses dashboard or `/metrics` HTTP endpoint here yet.
